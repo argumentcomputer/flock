@@ -20,6 +20,7 @@
 pub mod aggregate;
 pub mod bits;
 pub mod challenger;
+pub mod channel;
 pub mod circuit;
 pub mod element_r1cs;
 pub mod field;

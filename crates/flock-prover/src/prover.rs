@@ -493,6 +493,8 @@ enum UnionProveBinding<'a> {
 struct CircuitProverInput<'a> {
     circuit: &'a flock_core::circuit::Circuit,
     public: &'a [F128],
+    /// The circuit's multiset channels, proven after the wiring.
+    channels: &'a [flock_core::channel::ChannelSpec],
 }
 
 /// The **circuit** prove entry over the MERGED transport — the production
@@ -521,6 +523,38 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
     Commitment,
     flock_core::proof::UnionClassClaims,
 ) {
+    prove_fast_ligerito_union_circuit_with_channels(
+        union,
+        circuit,
+        public,
+        &[],
+        pcs_params,
+        slots,
+        element_slots,
+        challenger,
+    )
+}
+
+/// [`prove_fast_ligerito_union_circuit`] with multiset channels
+/// ([`flock_core::channel`]): each spec is proven after the wiring, in
+/// order, and its claims join the same merged opening. Verify with
+/// [`flock_core::verifier::verify_ligerito_union_circuit_with_channels`]
+/// (or the `_deferred` twin) under the same specs.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_fast_ligerito_union_circuit_with_channels<Ch: Challenger>(
+    union: &flock_core::union::UnionInstance<'_>,
+    circuit: &flock_core::circuit::Circuit,
+    public: &[F128],
+    channels: &[flock_core::channel::ChannelSpec],
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+    challenger: &mut Ch,
+) -> (
+    flock_core::proof::R1csProofCircuitMerged,
+    Commitment,
+    flock_core::proof::UnionClassClaims,
+) {
     assert!(
         circuit.check_instance(union),
         "the circuit and the union instance must be the same statement \
@@ -530,9 +564,17 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
         circuit.check_public(public),
         "the public segment must have the circuit's declared length and fixed constants"
     );
+    assert!(
+        channels.iter().all(|spec| spec.check(circuit)),
+        "every channel spec must fit the circuit"
+    );
     let (out, commitment) = prove_union_with_binding(
         union,
-        UnionProveBinding::Circuit(CircuitProverInput { circuit, public }),
+        UnionProveBinding::Circuit(CircuitProverInput {
+            circuit,
+            public,
+            channels,
+        }),
         pcs_params,
         slots,
         element_slots,
@@ -542,6 +584,7 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
         boolean,
         element,
         wiring,
+        channels,
         pcs_open,
     } = out;
     let (bool_proof, bool_claim) = match boolean {
@@ -552,17 +595,20 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
         Some((p, c)) => (Some(p), Some(c)),
         None => (None, None),
     };
+    let (channel_proofs, channel_outputs): (Vec<_>, Vec<_>) = channels.into_iter().unzip();
     (
         flock_core::proof::R1csProofCircuitMerged {
             boolean: bool_proof,
             element: el_proof,
             wiring: wiring.expect("the circuit binding runs the wiring argument"),
+            channels: channel_proofs,
             pcs_open,
         },
         commitment,
         flock_core::proof::UnionClassClaims {
             boolean: bool_claim,
             element: el_claim,
+            channels: channel_outputs,
         },
     )
 }
@@ -671,7 +717,11 @@ pub fn prove_fast_ligerito_union_circuit_ag<Ch: Challenger>(
     );
     let (out, commitment) = prove_union_with_binding_zc(
         union,
-        UnionProveBinding::Circuit(CircuitProverInput { circuit, public }),
+        UnionProveBinding::Circuit(CircuitProverInput {
+            circuit,
+            public,
+            channels: &[],
+        }),
         BooleanZcKind::Ag,
         pcs_params,
         slots,
@@ -682,8 +732,10 @@ pub fn prove_fast_ligerito_union_circuit_ag<Ch: Challenger>(
         boolean,
         element,
         wiring,
+        channels,
         pcs_open,
     } = out;
+    debug_assert!(channels.is_empty(), "the AG entry declares no channels");
     let (bool_proof, bool_claim) = match boolean {
         Some((p, c)) => {
             let UnionBooleanProof::Ag(p) = p else {
@@ -702,12 +754,14 @@ pub fn prove_fast_ligerito_union_circuit_ag<Ch: Challenger>(
             boolean: bool_proof,
             element: el_proof,
             wiring: wiring.expect("the circuit binding runs the wiring argument"),
+            channels: Vec::new(),
             pcs_open,
         },
         commitment,
         flock_core::proof::UnionClassClaims {
             boolean: bool_claim,
             element: el_claim,
+            channels: Vec::new(),
         },
     )
 }
@@ -799,6 +853,11 @@ struct UnionProveOutput {
     /// The wiring argument's transcript — `Some` exactly under
     /// [`UnionProveBinding::Circuit`].
     wiring: Option<flock_core::circuit::WiringProof>,
+    /// The channel arguments' transcripts and outputs, in spec order.
+    channels: Vec<(
+        flock_core::channel::ChannelProof,
+        flock_core::channel::ChannelOutput,
+    )>,
     pcs_open: pcs::MergedOpenProof,
 }
 
@@ -1359,6 +1418,36 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
         );
     }
 
+    // ---- The multiset channels, AFTER the wiring on the parent transcript
+    // (a sampled channel challenge follows every class message and the
+    // wiring's merge) and BEFORE the opening their claims join. They read the
+    // same padded buffer for the same reason the wiring does.
+    let t = std::time::Instant::now();
+    let mut channels = Vec::new();
+    let mut channel_claims: Vec<pcs::PackedDirectClaim> = Vec::new();
+    if let UnionProveBinding::Circuit(ci) = &binding {
+        for spec in ci.channels {
+            let (proof, claims, output) = flock_core::channel::prove_channel(
+                ci.circuit,
+                &z_packed,
+                ci.public,
+                spec,
+                pcs_params.product_gkr_grinding(),
+                challenger,
+            );
+            channel_claims.extend(claims);
+            channels.push((proof, output));
+        }
+    }
+    if trace && !channels.is_empty() {
+        eprintln!(
+            "  [prove_union] channels ({}, {} claims): {:7.2} ms",
+            channels.len(),
+            channel_claims.len(),
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
     // ---- One opening over every claim: the boolean pair ring-switched (as
     // quirky points), the element pair and the wiring's gather claims
     // PACKED-DIRECT — carried unbuilt by the merged open (it derives its
@@ -1387,6 +1476,7 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
         packed_direct.extend(gather_claims);
         proof
     });
+    packed_direct.extend(channel_claims);
     let t_w = t.elapsed().as_secs_f64() * 1e3;
     if trace {
         eprintln!(
@@ -1461,6 +1551,7 @@ fn prove_union_with_binding_zc<Ch: Challenger>(
             boolean: boolean.map(|(piop, claim, _, _)| (piop, claim)),
             element,
             wiring,
+            channels,
             pcs_open,
         },
         commitment,
@@ -2018,6 +2109,7 @@ pub fn prove_fast_ligerito_union_mixed_class<Ch: Challenger>(
         element,
         wiring,
         pcs_open,
+        channels: _,
     } = out;
     debug_assert!(wiring.is_none(), "the Mixed binding runs no wiring");
     let (bool_proof, bool_claim) = match boolean {
@@ -2038,6 +2130,7 @@ pub fn prove_fast_ligerito_union_mixed_class<Ch: Challenger>(
         flock_core::proof::UnionClassClaims {
             boolean: bool_claim,
             element: el_claim,
+            channels: Vec::new(),
         },
     )
 }

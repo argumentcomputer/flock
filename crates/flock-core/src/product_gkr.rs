@@ -1127,7 +1127,7 @@ impl BatchedGrinding {
     }
 
     #[inline]
-    fn fingerprint_bits_for(self, live_entries: usize) -> u32 {
+    pub fn fingerprint_bits_for(self, live_entries: usize) -> u32 {
         if self.fingerprint_bits == 0 {
             0
         } else {
@@ -1281,67 +1281,32 @@ fn sparse_sigma_eval(sigma: &[usize], m: &LiveMask, rho: &[F128]) -> F128 {
         .reduce(|| F128::ZERO, |a, b| a + b)
 }
 
-/// The GROUPED masked pipeline (phase 2b): live-prefix leaves, prefix-only
-/// layer building and folds, and round messages with closed-form all-ones
-/// tails. Transcript-identical to the dense masked pipeline (the
-/// `grouped_matches_dense_masked` oracle).
-fn prove_batched_grouped<C: Challenger>(
-    f: &[F128],
-    g: &[F128],
-    sigma: &[usize],
-    m: &LiveMask,
-    alpha: F128,
-    beta: F128,
+/// The endpoint of one grouped layer stack: both roots, the per-layer
+/// reductions, and the collapsed claims `lhs(ρ)`, `rhs(ρ)` at the shared
+/// final point.
+struct GroupedLayers {
+    top_lhs: F128,
+    top_rhs: F128,
+    layers: Vec<BatchedLayerProof>,
+    claim_l: F128,
+    claim_r: F128,
+    rho: Vec<F128>,
+}
+
+/// The grouped layer machinery over two leaf vectors (dead entries are
+/// implicit ones, never read): observes both roots, runs the `mu`
+/// λ-combined layer sumchecks and returns the collapsed input-layer claims.
+/// Shared by the σ-tagged batched prover and the tag-free channel prover;
+/// the transcript it writes is exactly the former inline sequence.
+fn run_layers_grouped<C: Challenger>(
+    lhs: GVec,
+    rhs: GVec,
+    mu: usize,
     grinding: BatchedGrinding,
     grinding_nonces: &mut Vec<u64>,
     ch: &mut C,
-) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
-    let n = f.len();
-    let mu = n.trailing_zeros() as usize;
-    assert!(mu <= 64, "s_id-as-index needs μ ≤ 64");
-    let tag = |i: usize| F128::new(i as u64, 0);
-    let rows = 1usize << m.nu;
+) -> GroupedLayers {
     let mut t = std::time::Instant::now();
-
-    // Leaves: live prefixes only (tails are implicit 1s, never written).
-    // Parallel over (group, sub-chunk): the σ gather is read-only and the
-    // writes are disjoint — this pass was the GKR's single largest line
-    // multi-threaded (~2.9M live entries, serial).
-    let mut lhs_buf = crate::scratch::take_f128(n);
-    let mut rhs_buf = crate::scratch::take_f128(n);
-    const LEAF_CH: usize = 1 << 14;
-    lhs_buf[..n]
-        .par_chunks_mut(rows)
-        .zip(rhs_buf[..n].par_chunks_mut(rows))
-        .enumerate()
-        .for_each(|(iota, (lg, rg))| {
-            let cnt = m.counts[iota];
-            let base = iota * rows;
-            lg[..cnt]
-                .par_chunks_mut(LEAF_CH)
-                .zip(rg[..cnt].par_chunks_mut(LEAF_CH))
-                .enumerate()
-                .for_each(|(ci, (lc, rc))| {
-                    let start = base + ci * LEAF_CH;
-                    for (i, (l, r)) in lc.iter_mut().zip(rc.iter_mut()).enumerate() {
-                        let x = start + i;
-                        *l = f[x] + alpha * tag(x) + beta;
-                        *r = g[x] + alpha * tag(sigma[x]) + beta;
-                    }
-                });
-        });
-    let lhs = GVec {
-        buf: lhs_buf,
-        lens: m.counts.clone(),
-        rows,
-    };
-    let rhs = GVec {
-        buf: rhs_buf,
-        lens: m.counts.clone(),
-        rows,
-    };
-    tp(&mut t, "  leaves(grouped)");
-
     // Layer stack, built downward: stack[d] is layer `mu − d`.
     let mut l_layers: Vec<GVec> = Vec::with_capacity(mu + 1);
     let mut r_layers: Vec<GVec> = Vec::with_capacity(mu + 1);
@@ -1504,6 +1469,86 @@ fn prove_batched_grouped<C: Challenger>(
         );
     }
     tp(&mut t, "layer-sumchecks(grouped)");
+    GroupedLayers {
+        top_lhs,
+        top_rhs,
+        layers,
+        claim_l,
+        claim_r,
+        rho: r_pt,
+    }
+}
+
+/// The GROUPED masked pipeline (phase 2b): live-prefix leaves, prefix-only
+/// layer building and folds, and round messages with closed-form all-ones
+/// tails. Transcript-identical to the dense masked pipeline (the
+/// `grouped_matches_dense_masked` oracle).
+fn prove_batched_grouped<C: Challenger>(
+    f: &[F128],
+    g: &[F128],
+    sigma: &[usize],
+    m: &LiveMask,
+    alpha: F128,
+    beta: F128,
+    grinding: BatchedGrinding,
+    grinding_nonces: &mut Vec<u64>,
+    ch: &mut C,
+) -> (ProductGkrBatchedProof, ProductGkrBatchedClaim) {
+    let n = f.len();
+    let mu = n.trailing_zeros() as usize;
+    assert!(mu <= 64, "s_id-as-index needs μ ≤ 64");
+    let tag = |i: usize| F128::new(i as u64, 0);
+    let rows = 1usize << m.nu;
+    let mut t = std::time::Instant::now();
+
+    // Leaves: live prefixes only (tails are implicit 1s, never written).
+    // Parallel over (group, sub-chunk): the σ gather is read-only and the
+    // writes are disjoint — this pass was the GKR's single largest line
+    // multi-threaded (~2.9M live entries, serial).
+    let mut lhs_buf = crate::scratch::take_f128(n);
+    let mut rhs_buf = crate::scratch::take_f128(n);
+    const LEAF_CH: usize = 1 << 14;
+    lhs_buf[..n]
+        .par_chunks_mut(rows)
+        .zip(rhs_buf[..n].par_chunks_mut(rows))
+        .enumerate()
+        .for_each(|(iota, (lg, rg))| {
+            let cnt = m.counts[iota];
+            let base = iota * rows;
+            lg[..cnt]
+                .par_chunks_mut(LEAF_CH)
+                .zip(rg[..cnt].par_chunks_mut(LEAF_CH))
+                .enumerate()
+                .for_each(|(ci, (lc, rc))| {
+                    let start = base + ci * LEAF_CH;
+                    for (i, (l, r)) in lc.iter_mut().zip(rc.iter_mut()).enumerate() {
+                        let x = start + i;
+                        *l = f[x] + alpha * tag(x) + beta;
+                        *r = g[x] + alpha * tag(sigma[x]) + beta;
+                    }
+                });
+        });
+    let lhs = GVec {
+        buf: lhs_buf,
+        lens: m.counts.clone(),
+        rows,
+    };
+    let rhs = GVec {
+        buf: rhs_buf,
+        lens: m.counts.clone(),
+        rows,
+    };
+    tp(&mut t, "  leaves(grouped)");
+
+    let GroupedLayers {
+        top_lhs,
+        top_rhs,
+        layers,
+        claim_l,
+        claim_r,
+        rho: r_pt,
+    } = run_layers_grouped(lhs, rhs, mu, grinding, grinding_nonces, ch);
+    t = std::time::Instant::now();
 
     let rho = r_pt;
     let basis = s_id_basis(mu);
@@ -1934,43 +1979,15 @@ fn verify_batched_core<C: Challenger>(
         return Err(VerifyError::ProductMismatch);
     }
 
-    let mut claim_l = proof.top_lhs;
-    let mut claim_r = proof.top_rhs;
-    let mut r_pt: Vec<F128> = Vec::new();
-    for (k, layer) in proof.layers.iter().enumerate() {
-        if layer.rounds.len() != k {
-            return Err(VerifyError::MalformedProof);
-        }
-        let lambda = verify_grind_sample(ch, grinding.lambda_bits)?;
-        let mut c_run = claim_l + lambda * claim_r;
-        let mut r_prime = Vec::with_capacity(k + 1);
-        for i in 0..k {
-            let (g1, g_inf) = layer.rounds[i];
-            let r_eq = r_pt[i];
-            let one_plus_r_eq = F128::ONE + r_eq;
-            let g0 = (c_run + r_eq * g1) * one_plus_r_eq.inv();
-            ch.observe_f128(g1);
-            ch.observe_f128(g_inf);
-            let rho = verify_grind_sample(ch, grinding.round_bits)?;
-            r_prime.push(rho);
-            let one_plus_rho = F128::ONE + rho;
-            c_run = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
-        }
-        let (vl0, vl1, vr0, vr1) = (layer.vl0, layer.vl1, layer.vr0, layer.vr1);
-        for v in [vl0, vl1, vr0, vr1] {
-            ch.observe_f128(v);
-        }
-        let gate = vl0 * vl1 + lambda * (vr0 * vr1);
-        if c_run != gate {
-            return Err(VerifyError::LayerCheckFailed);
-        }
-        let c_k = verify_grind_sample(ch, grinding.close_bits)?;
-        let one_plus_c = F128::ONE + c_k;
-        claim_l = one_plus_c * vl0 + c_k * vl1;
-        claim_r = one_plus_c * vr0 + c_k * vr1;
-        r_prime.push(c_k);
-        r_pt = r_prime;
-    }
+    let (claim_l, claim_r, r_pt) = verify_layers(
+        proof.top_lhs,
+        proof.top_rhs,
+        &proof.layers,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding,
+        ch,
+    )?;
 
     // Input-layer checks at the shared ρ: both reconstructed affinely, sharing
     // the single witness eval (f_eval = g_eval = w(ρ) when f = g = w). With a
@@ -2031,6 +2048,229 @@ fn verify_batched_core<C: Challenger>(
         g_eval: proof.g_eval,
         s_sigma_eval: s_sigma,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tag-free grand products (channels)
+// ---------------------------------------------------------------------------
+
+const DOMAIN_PLAIN: &[u8] = b"flock-product-gkr-plain-v0";
+
+/// A tag-free grand-product pair over caller-built leaf vectors: the product
+/// tree of `lhs` and of `rhs`, λ-combined layer by layer exactly as the
+/// batched σ-tagged proof, but with NO fingerprint (`α·s_id`), NO shift `β`
+/// and NO `s_σ` inside — the caller's leaves are whatever affine form its
+/// statement needs, and it reconstructs `lhs(ρ)`, `rhs(ρ)` itself. `∏ lhs =
+/// ∏ rhs` is NOT asserted here: both roots are observed and returned, so a
+/// caller can require equality (a balanced channel) or export them (a
+/// channel whose products join a larger statement).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlainGkrProof {
+    pub top_lhs: F128,
+    pub top_rhs: F128,
+    pub layers: Vec<BatchedLayerProof>,
+    /// `lhs(ρ)`: the MLE of the (dead = 1) leaf vector at the final point.
+    pub l_eval: F128,
+    /// `rhs(ρ)`.
+    pub r_eval: F128,
+    /// PoW witnesses in transcript order: per layer its lambda, round and
+    /// closing challenges (no fingerprint grind — the caller owns its
+    /// challenges).
+    #[serde(default)]
+    pub grinding_nonces: Vec<u64>,
+}
+
+/// The claims a verified [`PlainGkrProof`] leaves: the shared point and the
+/// two leaf-vector evaluations the caller must bind to its statement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlainGkrClaim {
+    pub rho: Vec<F128>,
+    pub l_eval: F128,
+    pub r_eval: F128,
+}
+
+impl BatchedGrinding {
+    /// Nonces a tag-free proof carries: no fingerprint grind, then per layer
+    /// its lambda, round and closing challenges.
+    pub fn plain_nonce_count(self, mu: usize) -> usize {
+        mu * usize::from(self.lambda_bits != 0)
+            + (mu * mu.saturating_sub(1) / 2) * usize::from(self.round_bits != 0)
+            + mu * usize::from(self.close_bits != 0)
+    }
+}
+
+/// Prove a tag-free grand-product pair over GROUPED leaf vectors: `lhs` and
+/// `rhs` are `groups · 2^nu` entries each (`groups` a power of two, the same
+/// on both sides), of which only the live prefix of every group
+/// (`lens_*[g]` entries, rows low) is read; dead entries are implicit ones.
+/// Both buffers are handed to the scratch pool afterwards.
+pub fn prove_plain_grouped<C: Challenger>(
+    lhs: Vec<F128>,
+    lens_l: Vec<usize>,
+    rhs: Vec<F128>,
+    lens_r: Vec<usize>,
+    nu: usize,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> (PlainGkrProof, PlainGkrClaim) {
+    let rows = 1usize << nu;
+    assert_eq!(
+        lens_l.len(),
+        lens_r.len(),
+        "both sides span the same groups"
+    );
+    let n = lens_l.len() * rows;
+    assert!(n.is_power_of_two() && n >= 2, "need N = 2^μ ≥ 2");
+    assert!(
+        lhs.len() >= n && rhs.len() >= n,
+        "leaf buffers span the domain"
+    );
+    assert!(
+        lens_l.iter().chain(&lens_r).all(|&l| l <= rows),
+        "live rows fit the row domain"
+    );
+    let mu = n.trailing_zeros() as usize;
+    ch.observe_label(DOMAIN_PLAIN);
+    let mut grinding_nonces = Vec::with_capacity(grinding.plain_nonce_count(mu));
+    let out = run_layers_grouped(
+        GVec {
+            buf: lhs,
+            lens: lens_l,
+            rows,
+        },
+        GVec {
+            buf: rhs,
+            lens: lens_r,
+            rows,
+        },
+        mu,
+        grinding,
+        &mut grinding_nonces,
+        ch,
+    );
+    ch.observe_f128(out.claim_l);
+    ch.observe_f128(out.claim_r);
+    (
+        PlainGkrProof {
+            top_lhs: out.top_lhs,
+            top_rhs: out.top_rhs,
+            layers: out.layers,
+            l_eval: out.claim_l,
+            r_eval: out.claim_r,
+            grinding_nonces,
+        },
+        PlainGkrClaim {
+            rho: out.rho,
+            l_eval: out.claim_l,
+            r_eval: out.claim_r,
+        },
+    )
+}
+
+/// Verify a tag-free grand-product pair for `N = 2^mu`. Checks the layer
+/// reductions and that the proof's leaf evaluations are the ones the layers
+/// collapse to; the caller must still bind `l_eval`/`r_eval` to its own
+/// affine reconstruction at `rho`, and decide what the two roots mean.
+pub fn verify_plain<C: Challenger>(
+    mu: usize,
+    proof: &PlainGkrProof,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> Result<PlainGkrClaim, VerifyError> {
+    if proof.layers.len() != mu {
+        return Err(VerifyError::MalformedProof);
+    }
+    if proof.grinding_nonces.len() != grinding.plain_nonce_count(mu) {
+        return Err(VerifyError::InvalidGrinding);
+    }
+    ch.observe_label(DOMAIN_PLAIN);
+    ch.observe_f128(proof.top_lhs);
+    ch.observe_f128(proof.top_rhs);
+    let mut nonce_idx = 0usize;
+    let (claim_l, claim_r, rho) = verify_layers(
+        proof.top_lhs,
+        proof.top_rhs,
+        &proof.layers,
+        &proof.grinding_nonces,
+        &mut nonce_idx,
+        grinding,
+        ch,
+    )?;
+    if claim_l != proof.l_eval || claim_r != proof.r_eval {
+        return Err(VerifyError::InputMismatch);
+    }
+    ch.observe_f128(proof.l_eval);
+    ch.observe_f128(proof.r_eval);
+    if nonce_idx != proof.grinding_nonces.len() {
+        return Err(VerifyError::InvalidGrinding);
+    }
+    Ok(PlainGkrClaim {
+        rho,
+        l_eval: proof.l_eval,
+        r_eval: proof.r_eval,
+    })
+}
+
+/// The `mu` layer reductions of a batched proof, from the (already observed)
+/// roots to the collapsed input-layer claims at the shared point. Mirrors
+/// [`run_layers_grouped`]'s transcript.
+fn verify_layers<C: Challenger>(
+    top_lhs: F128,
+    top_rhs: F128,
+    layers: &[BatchedLayerProof],
+    nonces: &[u64],
+    nonce_idx: &mut usize,
+    grinding: BatchedGrinding,
+    ch: &mut C,
+) -> Result<(F128, F128, Vec<F128>), VerifyError> {
+    let mut verify_grind_sample = |ch: &mut C, bits: u32| -> Result<F128, VerifyError> {
+        if bits != 0 {
+            let nonce = *nonces.get(*nonce_idx).ok_or(VerifyError::InvalidGrinding)?;
+            *nonce_idx += 1;
+            ch.verify_pow_and_sample_f128(nonce, bits)
+                .ok_or(VerifyError::InvalidGrinding)
+        } else {
+            Ok(ch.sample_f128())
+        }
+    };
+    let mut claim_l = top_lhs;
+    let mut claim_r = top_rhs;
+    let mut r_pt: Vec<F128> = Vec::new();
+    for (k, layer) in layers.iter().enumerate() {
+        if layer.rounds.len() != k {
+            return Err(VerifyError::MalformedProof);
+        }
+        let lambda = verify_grind_sample(ch, grinding.lambda_bits)?;
+        let mut c_run = claim_l + lambda * claim_r;
+        let mut r_prime = Vec::with_capacity(k + 1);
+        for i in 0..k {
+            let (g1, g_inf) = layer.rounds[i];
+            let r_eq = r_pt[i];
+            let one_plus_r_eq = F128::ONE + r_eq;
+            let g0 = (c_run + r_eq * g1) * one_plus_r_eq.inv();
+            ch.observe_f128(g1);
+            ch.observe_f128(g_inf);
+            let rho = verify_grind_sample(ch, grinding.round_bits)?;
+            r_prime.push(rho);
+            let one_plus_rho = F128::ONE + rho;
+            c_run = g0 * one_plus_rho + g1 * rho + g_inf * rho * one_plus_rho;
+        }
+        let (vl0, vl1, vr0, vr1) = (layer.vl0, layer.vl1, layer.vr0, layer.vr1);
+        for v in [vl0, vl1, vr0, vr1] {
+            ch.observe_f128(v);
+        }
+        let gate = vl0 * vl1 + lambda * (vr0 * vr1);
+        if c_run != gate {
+            return Err(VerifyError::LayerCheckFailed);
+        }
+        let c_k = verify_grind_sample(ch, grinding.close_bits)?;
+        let one_plus_c = F128::ONE + c_k;
+        claim_l = one_plus_c * vl0 + c_k * vl1;
+        claim_r = one_plus_c * vr0 + c_k * vr1;
+        r_prime.push(c_k);
+        r_pt = r_prime;
+    }
+    Ok((claim_l, claim_r, r_pt))
 }
 
 #[cfg(test)]

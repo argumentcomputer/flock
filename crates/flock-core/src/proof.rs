@@ -78,6 +78,11 @@ pub struct R1csProofCircuitMerged {
     pub boolean: Option<BooleanPiopProof>,
     pub element: Option<crate::element_r1cs::union::Proof>,
     pub wiring: crate::circuit::WiringProof,
+    /// Multiset channel arguments, in the circuit's channel-spec order;
+    /// empty for circuits without channels (and for every proof made
+    /// before channels existed).
+    #[serde(default)]
+    pub channels: Vec<crate::channel::ChannelProof>,
     pub pcs_open: pcs::MergedOpenProof,
 }
 
@@ -127,6 +132,9 @@ pub struct R1csProofCircuitMergedAg {
     pub boolean: Option<BooleanPiopProofAg>,
     pub element: Option<crate::element_r1cs::union::Proof>,
     pub wiring: crate::circuit::WiringProof,
+    /// See [`R1csProofCircuitMerged::channels`].
+    #[serde(default)]
+    pub channels: Vec<crate::channel::ChannelProof>,
     pub pcs_open: pcs::MergedOpenProof,
 }
 
@@ -138,6 +146,9 @@ pub struct UnionClassClaims {
     /// Element C + LC, in union word coordinates — `None` when the registry
     /// has no element types.
     pub element: Option<crate::element_r1cs::union::Claims>,
+    /// Each verified channel's challenge and both roots, in spec order;
+    /// empty without channels.
+    pub channels: Vec<crate::channel::ChannelOutput>,
 }
 
 /// A claim of the form `ẑ(point) = value` for the witness `z`.

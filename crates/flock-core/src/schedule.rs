@@ -53,7 +53,7 @@ const IO_SCHEMA_LABEL: &[u8] = b"flock-io-schema-v0";
 /// layer uses it for the dataflow order that acyclicity is checked against,
 /// and witness generation uses it to assert that a class's several producers
 /// agree.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum IoDirection {
     In,
     Out,
@@ -84,7 +84,7 @@ impl IoDirection {
 /// union word `(o_t >> 7) + (w << nu) + j` — see
 /// [`crate::union::UnionInstance::slot_word_range`] and
 /// [`crate::circuit::CellSpace::gate_word_addr`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IoWord {
     /// Word-column index within the type's row, `< ceil(useful_bits / 128)`.
     pub word_col: usize,

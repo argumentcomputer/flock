@@ -30,6 +30,11 @@ pub enum VerifyError {
     ClassMismatch,
     /// The wiring (copy-constraint) argument rejected.
     Wiring(crate::circuit::WiringError),
+    /// A multiset channel argument rejected.
+    Channel(crate::channel::ChannelError),
+    /// The proof carries a different number of channel arguments than the
+    /// statement's channel specs.
+    ChannelMismatch,
     /// The circuit and the union instance are not the same statement: a
     /// different registry, or gate counts that are not the union's declared
     /// counts. A rejection, not a panic — both come from the caller.
@@ -144,6 +149,8 @@ enum UnionVerifyBinding<'a> {
     Circuit {
         circuit: &'a crate::circuit::Circuit,
         public: &'a [F128],
+        /// The circuit's multiset channels, replayed after the wiring.
+        channels: &'a [crate::channel::ChannelSpec],
     },
 }
 
@@ -214,6 +221,7 @@ pub fn verify_ligerito_union_ag<Ch: Challenger>(
         Some(BooleanPiopRef::Ag(&proof.boolean)),
         None,
         None,
+        &[],
         false,
         pcs_params,
         challenger,
@@ -244,10 +252,11 @@ pub fn verify_ligerito_union_ag<Ch: Challenger>(
 /// — the wiring's gather claims are packed-direct, which the merged
 /// transport carries the same way it carries the element class's.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_ligerito_union_circuit<Ch: Challenger>(
+pub fn verify_ligerito_union_circuit_with_channels<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuit: &crate::circuit::Circuit,
     public: &[F128],
+    channels: &[crate::channel::ChannelSpec],
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
     proof: &crate::proof::R1csProofCircuitMerged,
@@ -264,12 +273,17 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
     }
     let (claims, packed_direct_points, matrix, el_matrix, _sigma) = verify_union_piops(
         union,
-        UnionVerifyBinding::Circuit { circuit, public },
+        UnionVerifyBinding::Circuit {
+            circuit,
+            public,
+            channels,
+        },
         circuits,
         commitment,
         proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         Some(&proof.wiring),
+        &proof.channels,
         false,
         pcs_params,
         challenger,
@@ -313,10 +327,11 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
 /// lincheck is simply wrong still returns `Ok` here. Callers that are not
 /// accumulating must use [`verify_ligerito_union_circuit`].
 #[allow(clippy::too_many_arguments)]
-pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
+pub fn verify_ligerito_union_circuit_deferred_with_channels<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuit: &crate::circuit::Circuit,
     public: &[F128],
+    channels: &[crate::channel::ChannelSpec],
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
     proof: &crate::proof::R1csProofCircuitMerged,
@@ -340,12 +355,17 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
     }
     let (claims, packed_direct_points, matrix, el_matrix, sigma) = verify_union_piops(
         union,
-        UnionVerifyBinding::Circuit { circuit, public },
+        UnionVerifyBinding::Circuit {
+            circuit,
+            public,
+            channels,
+        },
         circuits,
         commitment,
         proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         Some(&proof.wiring),
+        &proof.channels,
         true,
         pcs_params,
         challenger,
@@ -396,12 +416,17 @@ pub fn verify_ligerito_union_circuit_ag<Ch: Challenger>(
     }
     let (claims, packed_direct_points, matrix, el_matrix, _sigma) = verify_union_piops(
         union,
-        UnionVerifyBinding::Circuit { circuit, public },
+        UnionVerifyBinding::Circuit {
+            circuit,
+            public,
+            channels: &[],
+        },
         circuits,
         commitment,
         proof.boolean.as_ref().map(BooleanPiopRef::Ag),
         proof.element.as_ref(),
         Some(&proof.wiring),
+        &proof.channels,
         false,
         pcs_params,
         challenger,
@@ -455,12 +480,17 @@ pub fn verify_ligerito_union_circuit_ag_deferred<Ch: Challenger>(
     }
     let (claims, packed_direct_points, matrix, el_matrix, sigma) = verify_union_piops(
         union,
-        UnionVerifyBinding::Circuit { circuit, public },
+        UnionVerifyBinding::Circuit {
+            circuit,
+            public,
+            channels: &[],
+        },
         circuits,
         commitment,
         proof.boolean.as_ref().map(BooleanPiopRef::Ag),
         proof.element.as_ref(),
         Some(&proof.wiring),
+        &proof.channels,
         true,
         pcs_params,
         challenger,
@@ -586,6 +616,7 @@ pub fn verify_ligerito_union_mixed_class<Ch: Challenger>(
         proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         None,
+        &[],
         false,
         pcs_params,
         challenger,
@@ -681,6 +712,7 @@ pub fn verify_ligerito_union_mixed_class_deferred<Ch: Challenger>(
         proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         None,
+        &[],
         false,
         pcs_params,
         challenger,
@@ -768,6 +800,7 @@ fn verify_union_piops<Ch: Challenger>(
     boolean: Option<BooleanPiopRef<'_>>,
     element: Option<&crate::element_r1cs::union::Proof>,
     wiring: Option<&crate::circuit::WiringProof>,
+    channel_proofs: &[crate::channel::ChannelProof],
     defer_sigma: bool,
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
@@ -795,9 +828,9 @@ fn verify_union_piops<Ch: Challenger>(
     verifier_pool().install(|| -> Result<UnionPiopOut, VerifyError> {
         match binding {
             UnionVerifyBinding::Mixed => union.bind_statement(challenger, commitment),
-            UnionVerifyBinding::Circuit { circuit, public } => {
-                union.bind_statement_circuit(challenger, commitment, &circuit.digest(), public)
-            }
+            UnionVerifyBinding::Circuit {
+                circuit, public, ..
+            } => union.bind_statement_circuit(challenger, commitment, &circuit.digest(), public),
         }
 
         let mut matrix: Option<lincheck::MatrixAssertion> = None;
@@ -905,7 +938,10 @@ fn verify_union_piops<Ch: Challenger>(
         let mut par_gather: Option<Vec<(Vec<F128>, F128)>> = None;
         let mut sigma: Option<crate::circuit::SigmaAssertion> = None;
         if par_transcript {
-            let UnionVerifyBinding::Circuit { circuit, public } = binding else {
+            let UnionVerifyBinding::Circuit {
+                circuit, public, ..
+            } = binding
+            else {
                 unreachable!("par_transcript requires a circuit binding");
             };
             let proof = wiring.ok_or(VerifyError::CircuitMismatch)?;
@@ -969,7 +1005,10 @@ fn verify_union_piops<Ch: Challenger>(
         // paying its O(2^mu) discharge here — same transcript either way.
         if let Some(gather) = par_gather {
             packed_direct.extend(gather);
-        } else if let UnionVerifyBinding::Circuit { circuit, public } = binding {
+        } else if let UnionVerifyBinding::Circuit {
+            circuit, public, ..
+        } = binding
+        {
             let proof = wiring.ok_or(VerifyError::CircuitMismatch)?;
             #[cfg(feature = "mul-count")]
             let wiring_start = crate::field::gf2_128::op_count::snapshot();
@@ -1009,6 +1048,35 @@ fn verify_union_piops<Ch: Challenger>(
             packed_direct.extend(gather);
         }
 
+        // The multiset channels replay AFTER the wiring, at the prover's
+        // position; their gather claims join the same packed-direct intake.
+        let mut channel_outputs = Vec::new();
+        if let UnionVerifyBinding::Circuit {
+            circuit,
+            public,
+            channels,
+        } = binding
+        {
+            if channel_proofs.len() != channels.len() {
+                return Err(VerifyError::ChannelMismatch);
+            }
+            for (spec, proof) in channels.iter().zip(channel_proofs) {
+                let (gather, output) = crate::channel::verify_channel(
+                    circuit,
+                    public,
+                    spec,
+                    proof,
+                    pcs_params.product_gkr_grinding(),
+                    challenger,
+                )
+                .map_err(VerifyError::Channel)?;
+                packed_direct.extend(gather);
+                channel_outputs.push(output);
+            }
+        } else if !channel_proofs.is_empty() {
+            return Err(VerifyError::ChannelMismatch);
+        }
+
         // The circuit-structure accumulator also binds the succinct
         // verifier's remaining static helper evaluations. These values enter
         // Product-GKR/lincheck arithmetic above, but their truth depends only
@@ -1032,6 +1100,7 @@ fn verify_union_piops<Ch: Challenger>(
             crate::proof::UnionClassClaims {
                 boolean: bool_claim,
                 element: el_claim,
+                channels: channel_outputs,
             },
             packed_direct,
             matrix,
@@ -1370,6 +1439,65 @@ fn verify_core_inner<Ch: Challenger>(
     };
 
     Ok((ab, c))
+}
+
+/// [`verify_ligerito_union_circuit_with_channels`] for a circuit without
+/// channels — the entry every pre-channel caller uses.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitMerged,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    verify_ligerito_union_circuit_with_channels(
+        union,
+        circuit,
+        public,
+        &[],
+        circuits,
+        commitment,
+        proof,
+        pcs_params,
+        challenger,
+    )
+}
+
+/// [`verify_ligerito_union_circuit_deferred_with_channels`] for a circuit
+/// without channels.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitMerged,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<
+    (
+        crate::proof::UnionClassClaims,
+        DeferredMatrixWork,
+        crate::circuit::SigmaAssertion,
+    ),
+    VerifyError,
+> {
+    verify_ligerito_union_circuit_deferred_with_channels(
+        union,
+        circuit,
+        public,
+        &[],
+        circuits,
+        commitment,
+        proof,
+        pcs_params,
+        challenger,
+    )
 }
 
 #[cfg(test)]
