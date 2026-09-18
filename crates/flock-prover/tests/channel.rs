@@ -435,3 +435,63 @@ fn a_public_tuple_balances_a_missing_row() {
         "a wrong public tuple must be rejected"
     );
 }
+
+#[test]
+#[ignore] // Real proofs — run with `-- --ignored`.
+fn public_root_balance_pins_both_products_to_statement_words() {
+    let circuits = Circuits::new();
+    let mut rng = Rng::new(0xC4A1_1005);
+    let a = random_pairs(&mut rng, N);
+    let b = random_pairs(&mut rng, N - 2);
+    let (alpha, beta) = (rng.f128(), rng.f128());
+    let produced = native_product(&a, alpha, beta);
+    let consumed = native_product(&b, alpha, beta);
+    let public = [alpha, beta, produced, consumed];
+    let spec = ChannelSpec {
+        lhs: vec![row_tuple(0)],
+        rhs: vec![row_tuple(1)],
+        challenge: ChannelChallenge::Public { alpha: 0, beta: 1 },
+        balance: ChannelBalance::Public { lhs: 2, rhs: 3 },
+    };
+    let (union, circuit, pcs_params, proof, commitment, _) =
+        circuits.prove(&a, &b, &public, std::slice::from_ref(&spec));
+    let claims = verify(
+        &union,
+        &circuit,
+        &public,
+        std::slice::from_ref(&spec),
+        &commitment,
+        &proof,
+        &pcs_params,
+    )
+    .expect("roots equal to their statement words verify");
+    let out = claims.channels[0];
+    assert_eq!((out.top_lhs, out.top_rhs), (produced, consumed));
+
+    // A proof made under a statement claiming the wrong products is rejected
+    // as such: the prover never checks the balance, the verifier does.
+    let wrong = [alpha, beta, consumed, produced];
+    let (union, circuit, pcs_params, proof, commitment, _) =
+        circuits.prove(&a, &b, &wrong, std::slice::from_ref(&spec));
+    assert_eq!(
+        verify(
+            &union,
+            &circuit,
+            &wrong,
+            std::slice::from_ref(&spec),
+            &commitment,
+            &proof,
+            &pcs_params,
+        )
+        .err()
+        .map(|e| matches!(e, VerifyError::Channel(ChannelError::UnexportedRoot))),
+        Some(true),
+        "a root must equal its statement word"
+    );
+    // A spec naming statement words the circuit does not have is malformed.
+    let malformed = ChannelSpec {
+        balance: ChannelBalance::Public { lhs: 2, rhs: 4 },
+        ..spec.clone()
+    };
+    assert!(!malformed.check(&circuit));
+}

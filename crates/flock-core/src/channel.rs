@@ -90,6 +90,11 @@ pub enum ChannelBalance {
     Equal,
     /// Return both roots; the enclosing statement consumes them.
     Exported,
+    /// Require `∏ lhs` and `∏ rhs` to equal these two public words, so the
+    /// roots are statement words an enclosing relation composes (a product
+    /// that continues across many proofs) while the verifier still returns
+    /// them.
+    Public { lhs: usize, rhs: usize },
 }
 
 /// One channel: verifier policy, digest-free (the verifier holds it, like
@@ -138,6 +143,12 @@ impl ChannelSpec {
                 ChannelChallenge::Sampled => true,
                 ChannelChallenge::Public { alpha, beta } => {
                     alpha < circuit.num_public() && beta < circuit.num_public()
+                }
+            }
+            && match self.balance {
+                ChannelBalance::Equal | ChannelBalance::Exported => true,
+                ChannelBalance::Public { lhs, rhs } => {
+                    lhs < circuit.num_public() && rhs < circuit.num_public()
                 }
             }
     }
@@ -208,6 +219,8 @@ pub enum ChannelError {
     Recombination,
     /// `∏ lhs ≠ ∏ rhs` under [`ChannelBalance::Equal`].
     Unbalanced,
+    /// A root differs from its public word under [`ChannelBalance::Public`].
+    UnexportedRoot,
     /// A challenge grinding witness was missing, superfluous or wrong.
     InvalidGrinding,
 }
@@ -412,8 +425,18 @@ pub fn verify_channel<C: Challenger>(
 
     let claim =
         product_gkr::verify_plain(mu, &proof.gkr, grinding, ch).map_err(ChannelError::Gkr)?;
-    if spec.balance == ChannelBalance::Equal && proof.gkr.top_lhs != proof.gkr.top_rhs {
-        return Err(ChannelError::Unbalanced);
+    match spec.balance {
+        ChannelBalance::Equal => {
+            if proof.gkr.top_lhs != proof.gkr.top_rhs {
+                return Err(ChannelError::Unbalanced);
+            }
+        }
+        ChannelBalance::Public { lhs, rhs } => {
+            if proof.gkr.top_lhs != public[lhs] || proof.gkr.top_rhs != public[rhs] {
+                return Err(ChannelError::UnexportedRoot);
+            }
+        }
+        ChannelBalance::Exported => {}
     }
 
     // Recombination: `L̂(ρ) = Σ_g eq(ρ_group, g)·Σ_k α^k·v_{g,k} + (β+1)·live(ρ) + 1`,
