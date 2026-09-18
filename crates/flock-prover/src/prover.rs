@@ -619,6 +619,86 @@ pub fn prove_fast_ligerito_union_circuit_with_channels<Ch: Challenger>(
     )
 }
 
+/// Pass one of a two-pass protocol: the union witness and its dense-stack
+/// commitment, exactly as [`prove_fast_ligerito_union_circuit_with_channels`]
+/// computes them, and nothing more. A caller derives a challenge from every
+/// pass-one commitment (a public channel challenge, say) and then proves the
+/// same witness under it: the commitment is deterministic in the witness, so
+/// the second pass reproduces this one. The witness buffers return to their
+/// pools as the full prover returns them.
+pub fn commit_fast_ligerito_union(
+    union: &flock_core::union::UnionInstance<'_>,
+    pcs_params: &PcsParams,
+    slots: Vec<UnionSlotProverInput<'_>>,
+    element_slots: Vec<UnionElementSlotInput<'_>>,
+) -> Commitment {
+    assert_eq!(
+        pcs_params.m,
+        union.dense_m(),
+        "PcsParams.m must equal the union's dense_m (committed stack size)"
+    );
+    assert_eq!(
+        slots.len(),
+        union.num_boolean(),
+        "need one prover input per BOOLEAN registry type"
+    );
+    assert_eq!(
+        element_slots.len(),
+        union.num_element(),
+        "need one element prover input per ELEMENT registry type"
+    );
+    let mut sources = Vec::with_capacity(slots.len() + element_slots.len());
+    for slot in slots {
+        sources.push(slot.source);
+    }
+    for (ty, input) in union.registry().element_types().iter().zip(element_slots) {
+        let element = match &ty.class {
+            flock_core::schedule::TableClass::LargeField(el) => el.clone(),
+            flock_core::schedule::TableClass::Boolean => {
+                unreachable!("element_types() are LargeField")
+            }
+        };
+        sources.push(UnionSlotWitnessSource::Element {
+            ty: element,
+            generate: input.generate,
+        });
+    }
+    // The same padding contract as the full prover (see there).
+    let padding_unread = !union.has_element()
+        && !union.compaction_is_identity()
+        && union.m_total() - union.n_log() >= pcs::LOG_PACKING;
+    let (z_packed, a_packed, b_packed, stripes, buf_mode) =
+        build_union_witness(union, sources, padding_unread);
+    let give_back = buf_mode != flock_core::union::WitnessBufMode::FreshZeroed;
+    let q_owned: Option<Vec<F128>> = if union.compaction_is_identity() {
+        None
+    } else if buf_mode == flock_core::union::WitnessBufMode::PooledDirty {
+        Some(union.compact_witness_unchecked(&z_packed))
+    } else {
+        Some(union.compact_witness(&z_packed))
+    };
+    let q: &[F128] = q_owned.as_deref().unwrap_or(&z_packed);
+    let (commitment, _prover_data) = if pcs_params.num_lanes.is_some() {
+        pcs::commit_lane_major(q, pcs_params)
+    } else {
+        pcs::commit(q, pcs_params)
+    };
+    drop(q_owned);
+    if give_back {
+        flock_core::scratch::give_f128(z_packed);
+        flock_core::scratch::give_f128(a_packed);
+        flock_core::scratch::give_f128(b_packed);
+    } else {
+        union.give_back_witness_buffer(z_packed);
+        union.give_back_witness_buffer(a_packed);
+        union.give_back_witness_buffer(b_packed);
+    }
+    for stripe in stripes {
+        flock_core::scratch::give_u8(stripe);
+    }
+    commitment
+}
+
 /// The MERGED-transport union prover (wire v6; design doc §"Capacity-free
 /// ring-switching") — the Mixed protocol's prove entry for BOOLEAN-only
 /// registries: a thin wrapper over [`prove_union_with_binding`] (the one
