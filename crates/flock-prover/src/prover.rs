@@ -472,6 +472,28 @@ fn build_union_witness(
             }
         })
         .collect();
+    // Declared counts: rows `[declared_t, counts_t)` of every boolean slot
+    // are committed (the layout keeps them) and must be complete zero rows,
+    // pin included — the drivers generated the declared prefix only.
+    if union.has_declared_counts() {
+        use rayon::prelude::*;
+        let nb = union.num_boolean();
+        let types = union.registry().types();
+        for t in 0..nb {
+            let (n_t, d_t) = (union.counts()[t], union.declared_counts()[t]);
+            if d_t >= n_t {
+                continue;
+            }
+            let range = union.slot_word_range(t);
+            let n_cols = 1usize << (types[t].k_log - 7);
+            for buf in [&mut z, &mut a, &mut b] {
+                buf[range.clone()]
+                    .par_chunks_mut(1 << nu)
+                    .take(n_cols)
+                    .for_each(|column| column[d_t..n_t].fill(F128::ZERO));
+            }
+        }
+    }
     (z, a, b, stripes, mode)
 }
 

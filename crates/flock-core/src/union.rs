@@ -110,6 +110,23 @@ impl<'r> UnionInstance<'r> {
         self.instance.counts()
     }
 
+    /// [`Instance::with_declared_counts`]: declared rows under this layout.
+    pub fn with_declared_counts(self, declared: Vec<usize>) -> Self {
+        Self {
+            instance: self.instance.with_declared_counts(declared),
+            dense_floor_m: self.dense_floor_m,
+        }
+    }
+
+    pub fn has_declared_counts(&self) -> bool {
+        self.instance.has_declared_counts()
+    }
+
+    /// [`Instance::declared_counts`]: the rows the boolean PIOP covers.
+    pub fn declared_counts(&self) -> &[usize] {
+        self.instance.declared_counts()
+    }
+
     /// Union variable count `M`: the address space is `{0,1}^M`. The
     /// sumchecks run `M` rounds; registry-static, count-independent.
     pub fn m_total(&self) -> usize {
@@ -627,6 +644,21 @@ impl<'r> UnionInstance<'r> {
         challenger.observe_bytes(commitment.cap.as_flattened());
     }
 
+    /// Declared counts bind after the statement, under their own label, so
+    /// an instance without them keeps its transcript and every earlier
+    /// payload keeps its position.
+    fn bind_declared_counts<Ch: Challenger>(&self, challenger: &mut Ch) {
+        if !self.has_declared_counts() {
+            return;
+        }
+        challenger.observe_label(b"flock-declared-counts-v0");
+        let mut declared_le = Vec::with_capacity(8 * self.declared_counts().len());
+        for &d_t in self.declared_counts() {
+            declared_le.extend_from_slice(&(d_t as u64).to_le_bytes());
+        }
+        challenger.observe_bytes(&declared_le);
+    }
+
     /// [`Self::bind_statement`] plus the CIRCUIT half of the statement: the
     /// circuit digest ([`crate::circuit::Circuit::digest`], which covers the
     /// gate counts, the IO schemas through the registry digest, the wiring and
@@ -657,6 +689,7 @@ impl<'r> UnionInstance<'r> {
         challenger.observe_label(b"flock-circuit-stmt-v2");
         challenger.observe_bytes(circuit_digest);
         challenger.observe_bytes(&publics_digest(public));
+        self.bind_declared_counts(challenger);
     }
 
     // -----------------------------------------------------------------------

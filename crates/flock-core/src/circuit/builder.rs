@@ -928,13 +928,37 @@ impl CircuitShape {
             .iter()
             .map(|&d| self.slots[d].witness(rows[d].as_ref(), self.nu))
             .collect();
+        let content = self.content_rows(&values);
 
         CircuitWitness {
             public,
             witnesses,
             rows,
             slot_types: self.slot_types.clone(),
+            content,
         }
+    }
+
+    /// Per declared slot, one past the last row with a nonzero wired input
+    /// or output (hinted rows always count): rows after it are the gate's
+    /// evaluation of zero inputs, the zero row a declared count may drop.
+    fn content_rows(&self, values: &[F128]) -> Vec<usize> {
+        let mut content = vec![0usize; self.slots.len()];
+        let mut row = vec![0usize; self.slots.len()];
+        for step in &self.steps {
+            let r = row[step.slot];
+            row[step.slot] += 1;
+            if step.hinted
+                || step
+                    .inputs
+                    .iter()
+                    .chain(&step.outputs)
+                    .any(|&w| values[w] != F128::ZERO)
+            {
+                content[step.slot] = r + 1;
+            }
+        }
+        content
     }
 
     /// Compile the shape's [`FillPlan`].
@@ -1341,11 +1365,13 @@ impl CircuitShape {
                 t_run.elapsed().as_secs_f64() * 1e3,
             );
         }
+        let content = self.content_rows(&values);
         CircuitWitness {
             public,
             witnesses: vec![SlotWitness::DeferredToRows; self.order.len()],
             rows,
             slot_types: self.slot_types.clone(),
+            content,
         }
     }
 
@@ -1461,6 +1487,10 @@ pub struct CircuitWitness {
     /// Per-slot rows, in DECLARED order.
     rows: Vec<Box<dyn Any + Send>>,
     slot_types: Vec<TypeId>,
+    /// Per-slot content rows, in DECLARED order: one past the last row any
+    /// of whose wired inputs or outputs is nonzero (a hinted row always
+    /// counts). Every later row of the slot is the gate's zero row.
+    content: Vec<usize>,
 }
 
 impl CircuitWitness {
@@ -1474,6 +1504,12 @@ impl CircuitWitness {
     /// is what makes the wiring the builder emitted correct for that witness.
     ///
     /// Panics if `s` was not declared with `G`.
+    /// One past the slot's last row with a nonzero wired input or output:
+    /// the prefix a declared count may keep (see `Instance::with_declared_counts`).
+    pub fn content_rows(&self, s: SlotId) -> usize {
+        self.content[s.0]
+    }
+
     pub fn rows<G>(&self, s: SlotId) -> &[G::Row]
     where
         G: GateType + 'static,

@@ -654,6 +654,10 @@ impl Registry {
 pub struct Instance<'r> {
     registry: &'r Registry,
     counts: Vec<usize>,
+    /// Declared row counts under the layout `counts` fix: rows
+    /// `[declared_t, counts_t)` of slot `t` are complete zero rows (pin
+    /// included) the boolean PIOP skips. `None` declares every layout row.
+    declared: Option<Vec<usize>>,
 }
 
 impl<'r> Instance<'r> {
@@ -672,7 +676,41 @@ impl<'r> Instance<'r> {
                 registry.nu()
             );
         }
-        Self { registry, counts }
+        Self {
+            registry,
+            counts,
+            declared: None,
+        }
+    }
+
+    /// Declare `declared[t] <= counts[t]` rows per slot under this layout:
+    /// the commitment, the compaction, the jagged heights and the wiring's
+    /// live mask keep the layout counts, while the boolean zerocheck's
+    /// run-list and the union lincheck (its count-proportional folds and its
+    /// const-pin targets) run over the declared rows only. The prover must
+    /// write rows `[declared_t, counts_t)` as complete zero rows; the
+    /// transcript binds the declared counts beside the layout counts.
+    pub fn with_declared_counts(mut self, declared: Vec<usize>) -> Self {
+        assert_eq!(
+            declared.len(),
+            self.counts.len(),
+            "need one declared count per registry type"
+        );
+        for (t, (&d, &n)) in declared.iter().zip(&self.counts).enumerate() {
+            assert!(d <= n, "declared count d_{t} = {d} exceeds the layout count {n}");
+        }
+        self.declared = Some(declared);
+        self
+    }
+
+    pub fn has_declared_counts(&self) -> bool {
+        self.declared.is_some()
+    }
+
+    /// The rows the boolean PIOP covers per slot: the declared counts, or
+    /// the layout counts when none were declared.
+    pub fn declared_counts(&self) -> &[usize] {
+        self.declared.as_deref().unwrap_or(&self.counts)
     }
 
     pub fn registry(&self) -> &'r Registry {
@@ -773,7 +811,7 @@ impl<'r> Instance<'r> {
         for ((ty, slot), &n_t) in self.registry.types()[..nb]
             .iter()
             .zip(&self.registry.slots()[..nb])
-            .zip(&self.counts[..nb])
+            .zip(&self.declared_counts()[..nb])
         {
             let gap = slot.offset - cursor;
             runs.push(PaddingRun {

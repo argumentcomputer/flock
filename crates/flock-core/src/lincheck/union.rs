@@ -363,7 +363,7 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         .iter()
         .zip(registry.slots())
         .zip(slots)
-        .zip(union.counts())
+        .zip(union.declared_counts())
     {
         let y_t = partial_fold_packed_z_rows_best(
             slot_in.z_lincheck,
@@ -827,7 +827,7 @@ pub fn verify_union_deferred_with_grinding<Ch: Challenger>(
     let mut target = alpha * v_a + v_b;
     let mut betas: Vec<Option<F128>> = Vec::with_capacity(circuits.len());
     let mut pin_evals: Vec<Option<F128>> = Vec::with_capacity(circuits.len());
-    for (circuit, &n_t) in circuits.iter().zip(union.counts()) {
+    for (circuit, &n_t) in circuits.iter().zip(union.declared_counts()) {
         if circuit.const_pin_col().is_some() {
             let beta = if let Some(bits) = grinding.beta_bits() {
                 let beta = challenger
