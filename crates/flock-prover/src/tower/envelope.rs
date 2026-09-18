@@ -233,7 +233,7 @@ pub(super) fn slot_cached<G>(
 ) -> flock_core::circuit::builder::SlotId
 where
     G: GateType + Send + Sync + 'static,
-    G::Row: Send + 'static,
+    G::Row: Clone + Send + Sync + 'static,
     G::Hint: 'static,
 {
     match cache.iter().find(|&&(k, _)| k == key) {

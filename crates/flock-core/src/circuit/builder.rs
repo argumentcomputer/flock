@@ -141,6 +141,10 @@ trait SlotBuild: Any + Send + Sync {
     fn new_rows(&self) -> Box<dyn Any + Send>;
     /// Evaluate one gate, appending its row; outputs land on the scratch.
     fn push(&self, rows: &mut dyn Any, inputs: &[F128], hint: &dyn Any, outputs: &mut Vec<F128>);
+    /// Append the gate's ZERO row — its evaluation on all-zero inputs with
+    /// no hint, computed once per slot — and its outputs, for a step whose
+    /// inputs the runner found all zero.
+    fn push_zero(&self, rows: &mut dyn Any, outputs: &mut Vec<F128>);
     /// Evaluate `n` gates of this slot against the value tape in one
     /// monomorphic loop — the [`FillPlan`] runner. `in_idx`/`out_idx` are the
     /// gates' pre-resolved tape indices (`n_in`/`n_out` per gate, gate-major);
@@ -173,11 +177,14 @@ struct GateSlot<G: GateType> {
     table: Option<TableType>,
     n_in: usize,
     n_out: usize,
+    /// The gate's evaluation on all-zero inputs and its outputs, for steps
+    /// the runner memoizes.
+    zero: std::sync::OnceLock<(G::Row, Vec<F128>)>,
 }
 
 impl<G: GateType + Send + Sync + 'static> SlotBuild for GateSlot<G>
 where
-    G::Row: Send + 'static,
+    G::Row: Clone + Send + Sync + 'static,
     G::Hint: 'static,
 {
     fn take_table(&mut self) -> TableType {
@@ -213,6 +220,26 @@ where
             self.n_out
         );
         rows.push(row);
+    }
+    fn push_zero(&self, rows: &mut dyn Any, outputs: &mut Vec<F128>) {
+        let rows = rows
+            .downcast_mut::<Vec<G::Row>>()
+            .expect("row store belongs to another slot");
+        let (row, zero_outputs) = self.zero.get_or_init(|| {
+            let unit: &dyn Any = &();
+            let hint = unit.downcast_ref::<G::Hint>().unwrap_or_else(|| {
+                panic!(
+                    "a memoized step needs an unhinted gate, not a hint of type {}",
+                    std::any::type_name::<G::Hint>()
+                )
+            });
+            let mut outputs = Vec::with_capacity(self.n_out);
+            let row = self.gate.eval(&vec![F128::ZERO; self.n_in], hint, &mut outputs);
+            assert_eq!(outputs.len(), self.n_out, "gate output arity");
+            (row, outputs)
+        });
+        rows.push(row.clone());
+        outputs.extend_from_slice(zero_outputs);
     }
     fn run_batch(
         &self,
@@ -446,7 +473,7 @@ impl ShapeBuilder {
     pub fn slot<G>(&mut self, gate: G) -> SlotId
     where
         G: GateType + Send + Sync + 'static,
-        G::Row: Send + 'static,
+        G::Row: Clone + Send + Sync + 'static,
         G::Hint: 'static,
     {
         let table = gate.table();
@@ -465,6 +492,7 @@ impl ShapeBuilder {
             table: Some(table),
             n_in,
             n_out,
+            zero: std::sync::OnceLock::new(),
         }));
         self.slot_types.push(TypeId::of::<G>());
         self.rows_per_slot.push(0);
@@ -512,6 +540,11 @@ impl ShapeBuilder {
     /// [`Hint`](GateType::Hint) is `()`; use [`gate_hinted`] otherwise.
     ///
     /// [`gate_hinted`]: ShapeBuilder::gate_hinted
+    /// Gate instantiations so far: the step index the next gate receives.
+    pub fn steps_len(&self) -> usize {
+        self.steps.len()
+    }
+
     pub fn gate(&mut self, slot: SlotId, inputs: &[Wire]) -> Vec<Wire> {
         self.emit(slot, inputs, false)
     }
@@ -802,6 +835,10 @@ impl CircuitShape {
     pub fn registry_slot(&self, s: SlotId) -> usize {
         self.registry_slot[s.0]
     }
+    /// Gate instantiations so far, in order: the index the next gate gets.
+    pub fn steps_len(&self) -> usize {
+        self.steps.len()
+    }
 
     /// **The online phase.** Evaluate every gate against `inputs` and `hints`,
     /// producing this proof's witness and public segment.
@@ -818,6 +855,21 @@ impl CircuitShape {
     /// equal to it rather than overwriting it. That assertion is what
     /// [`ShapeBuilder::connect`] promises.
     pub fn run(&self, inputs: &[F128], hints: &[&(dyn Any + Sync)]) -> CircuitWitness {
+        self.run_skipping(inputs, hints, &[])
+    }
+
+    /// [`Self::run`] with the unhinted steps in `dead` (sorted, disjoint
+    /// instantiation ranges) memoized: a step there whose inputs are all
+    /// zero takes the gate's evaluation on zero inputs, computed once per
+    /// slot, instead of evaluating; every other step evaluates as usual, so
+    /// the witness is the same whatever `dead` names. A disabled
+    /// transition's rows are the intended use.
+    pub fn run_skipping(
+        &self,
+        inputs: &[F128],
+        hints: &[&(dyn Any + Sync)],
+        dead: &[core::ops::Range<usize>],
+    ) -> CircuitWitness {
         assert_eq!(
             inputs.len(),
             self.inputs.len(),
@@ -865,7 +917,7 @@ impl CircuitShape {
             }
             let prefix_end = self.islands[0].0;
             let suffix_start = self.islands.last().expect("nonempty").1;
-            self.exec_steps(0..prefix_end, &mut values, &mut set, &mut rows, hints, 0);
+            self.exec_steps(0..prefix_end, &mut values, &mut set, &mut rows, hints, 0, dead);
             let results: Vec<(Vec<F128>, Vec<bool>, Vec<Box<dyn Any + Send>>)> = self
                 .islands
                 .par_iter()
@@ -874,7 +926,7 @@ impl CircuitShape {
                     let mut st = set.clone();
                     let mut rw: Vec<Box<dyn Any + Send>> =
                         self.slots.iter().map(|s| s.new_rows()).collect();
-                    self.exec_steps(a..b, &mut v, &mut st, &mut rw, hints, hinted_before(a));
+                    self.exec_steps(a..b, &mut v, &mut st, &mut rw, hints, hinted_before(a), dead);
                     (v, st, rw)
                 })
                 .collect();
@@ -903,6 +955,7 @@ impl CircuitShape {
                 &mut rows,
                 hints,
                 hinted_before(suffix_start),
+                dead,
             );
         } else {
             self.exec_steps(
@@ -912,6 +965,7 @@ impl CircuitShape {
                 &mut rows,
                 hints,
                 0,
+                dead,
             );
         }
 
@@ -1425,6 +1479,7 @@ impl CircuitShape {
     /// Execute the steps in `range` against the given value state and row
     /// accumulators. `hint_base` is the number of hinted steps before the
     /// range (hints are consumed in absolute instantiation order).
+    #[allow(clippy::too_many_arguments)]
     fn exec_steps(
         &self,
         range: core::ops::Range<usize>,
@@ -1433,15 +1488,45 @@ impl CircuitShape {
         rows: &mut [Box<dyn Any + Send>],
         hints: &[&(dyn Any + Sync)],
         hint_base: usize,
+        dead: &[core::ops::Range<usize>],
     ) {
         let unit = ();
         let mut next_hint = hint_base;
+        // The first dead range that may still cover a step of this range.
+        let mut next_dead = dead.partition_point(|d| d.end <= range.start);
         // One scratch buffer for every step's input values — a fresh Vec per
         // gate call was a measurable slice of the online phase. Step wires
         // are pre-resolved to class roots by `finish`.
         let mut vals: Vec<F128> = Vec::with_capacity(16);
         let mut outs: Vec<F128> = Vec::with_capacity(16);
+        let range_start = range.start;
         for (step_i, step) in self.steps[range].iter().enumerate() {
+            let absolute = range_start + step_i;
+            while next_dead < dead.len() && dead[next_dead].end <= absolute {
+                next_dead += 1;
+            }
+            if next_dead < dead.len()
+                && dead[next_dead].contains(&absolute)
+                && !step.hinted
+                && step.inputs.iter().all(|&r| set[r] && values[r] == F128::ZERO)
+            {
+                outs.clear();
+                self.slots[step.slot].push_zero(rows[step.slot].as_mut(), &mut outs);
+                for (&r, &v) in step.outputs.iter().zip(&outs) {
+                    if set[r] {
+                        assert_eq!(
+                            values[r], v,
+                            "a connected wire disagrees with the gate output that produces it \
+                             (slot {}, class root {r}, step {absolute})",
+                            step.slot
+                        );
+                    } else {
+                        values[r] = v;
+                        set[r] = true;
+                    }
+                }
+                continue;
+            }
             vals.clear();
             for &r in &step.inputs {
                 assert!(
@@ -1570,7 +1655,7 @@ impl CircuitBuilder {
     pub fn slot<G>(&mut self, gate: G) -> SlotId
     where
         G: GateType + Send + Sync + 'static,
-        G::Row: Send + 'static,
+        G::Row: Clone + Send + Sync + 'static,
         G::Hint: 'static,
     {
         self.shape.slot(gate)
