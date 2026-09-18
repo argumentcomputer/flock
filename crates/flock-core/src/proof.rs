@@ -78,11 +78,6 @@ pub struct R1csProofCircuitMerged {
     pub boolean: Option<BooleanPiopProof>,
     pub element: Option<crate::element_r1cs::union::Proof>,
     pub wiring: crate::circuit::WiringProof,
-    /// Multiset channel arguments, in the circuit's channel-spec order;
-    /// empty for circuits without channels (and for every proof made
-    /// before channels existed).
-    #[serde(default)]
-    pub channels: Vec<crate::channel::ChannelProof>,
     pub pcs_open: pcs::MergedOpenProof,
 }
 
@@ -132,10 +127,17 @@ pub struct R1csProofCircuitMergedAg {
     pub boolean: Option<BooleanPiopProofAg>,
     pub element: Option<crate::element_r1cs::union::Proof>,
     pub wiring: crate::circuit::WiringProof,
-    /// See [`R1csProofCircuitMerged::channels`].
-    #[serde(default)]
-    pub channels: Vec<crate::channel::ChannelProof>,
     pub pcs_open: pcs::MergedOpenProof,
+}
+
+/// A circuit proof with multiset channels ([`crate::channel`]): the
+/// pre-channel circuit proof — its wire format unchanged, so every proof
+/// made before channels existed still decodes — plus one channel
+/// transcript per spec, in spec order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct R1csProofCircuitChannels {
+    pub circuit: R1csProofCircuitMerged,
+    pub channels: Vec<crate::channel::ChannelProof>,
 }
 
 /// The claims a verified mixed-class union proof leaves behind, per class.

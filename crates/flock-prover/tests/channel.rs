@@ -152,7 +152,7 @@ impl Circuits {
         UnionInstance<'_>,
         Circuit,
         PcsParams,
-        flock_core::proof::R1csProofCircuitMerged,
+        flock_core::proof::R1csProofCircuitChannels,
         flock_core::pcs::Commitment,
         flock_core::proof::UnionClassClaims,
     ) {
@@ -191,7 +191,7 @@ fn verify(
     public: &[F128],
     channels: &[ChannelSpec],
     commitment: &flock_core::pcs::Commitment,
-    proof: &flock_core::proof::R1csProofCircuitMerged,
+    proof: &flock_core::proof::R1csProofCircuitChannels,
     pcs_params: &PcsParams,
 ) -> Result<flock_core::proof::UnionClassClaims, VerifyError> {
     let mut ch = FsChallenger::new(DOMAIN);
@@ -240,17 +240,41 @@ fn balanced_channel_over_a_permutation_verifies() {
     assert_eq!(out.top_lhs, out.top_rhs);
     assert_eq!(out.top_lhs, native_product(&a, out.alpha, out.beta));
 
-    // The pre-channel entry declares no channels: the proof's extra
-    // argument is a statement mismatch, not something to skip.
+    // The inner circuit proof alone, under the pre-channel entry: that
+    // verifier never absorbs the channel, so its opening challenges diverge
+    // from the prover's and the proof is rejected — a channel proof is bound
+    // to the channel it ran, not detachable from it.
     let mut ch = FsChallenger::new(DOMAIN);
-    assert_eq!(
+    assert!(
         verifier::verify_ligerito_union_circuit(
             &union,
             &circuit,
             &[],
             &[],
             &commitment,
-            &proof,
+            &proof.circuit,
+            &pcs_params,
+            &mut ch,
+        )
+        .is_err(),
+        "the circuit proof must not verify with its channel stripped"
+    );
+    // And the channel entry with the channel transcripts stripped is a
+    // statement mismatch, not something to skip.
+    let stripped = flock_core::proof::R1csProofCircuitChannels {
+        circuit: proof.circuit.clone(),
+        channels: Vec::new(),
+    };
+    let mut ch = FsChallenger::new(DOMAIN);
+    assert_eq!(
+        verifier::verify_ligerito_union_circuit_with_channels(
+            &union,
+            &circuit,
+            &[],
+            std::slice::from_ref(&spec),
+            &[],
+            &commitment,
+            &stripped,
             &pcs_params,
             &mut ch,
         ),

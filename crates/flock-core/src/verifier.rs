@@ -252,11 +252,12 @@ pub fn verify_ligerito_union_ag<Ch: Challenger>(
 /// — the wiring's gather claims are packed-direct, which the merged
 /// transport carries the same way it carries the element class's.
 #[allow(clippy::too_many_arguments)]
-pub fn verify_ligerito_union_circuit_with_channels<Ch: Challenger>(
+fn verify_circuit_with_channel_proofs<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuit: &crate::circuit::Circuit,
     public: &[F128],
     channels: &[crate::channel::ChannelSpec],
+    channel_proofs: &[crate::channel::ChannelProof],
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
     proof: &crate::proof::R1csProofCircuitMerged,
@@ -283,7 +284,7 @@ pub fn verify_ligerito_union_circuit_with_channels<Ch: Challenger>(
         proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         Some(&proof.wiring),
-        &proof.channels,
+        channel_proofs,
         false,
         pcs_params,
         challenger,
@@ -327,11 +328,12 @@ pub fn verify_ligerito_union_circuit_with_channels<Ch: Challenger>(
 /// lincheck is simply wrong still returns `Ok` here. Callers that are not
 /// accumulating must use [`verify_ligerito_union_circuit`].
 #[allow(clippy::too_many_arguments)]
-pub fn verify_ligerito_union_circuit_deferred_with_channels<Ch: Challenger>(
+fn verify_circuit_deferred_with_channel_proofs<Ch: Challenger>(
     union: &crate::union::UnionInstance<'_>,
     circuit: &crate::circuit::Circuit,
     public: &[F128],
     channels: &[crate::channel::ChannelSpec],
+    channel_proofs: &[crate::channel::ChannelProof],
     circuits: &[&dyn lincheck::LincheckCircuit],
     commitment: &Commitment,
     proof: &crate::proof::R1csProofCircuitMerged,
@@ -365,7 +367,7 @@ pub fn verify_ligerito_union_circuit_deferred_with_channels<Ch: Challenger>(
         proof.boolean.as_ref().map(BooleanPiopRef::Rs),
         proof.element.as_ref(),
         Some(&proof.wiring),
-        &proof.channels,
+        channel_proofs,
         true,
         pcs_params,
         challenger,
@@ -426,7 +428,7 @@ pub fn verify_ligerito_union_circuit_ag<Ch: Challenger>(
         proof.boolean.as_ref().map(BooleanPiopRef::Ag),
         proof.element.as_ref(),
         Some(&proof.wiring),
-        &proof.channels,
+        &[],
         false,
         pcs_params,
         challenger,
@@ -490,7 +492,7 @@ pub fn verify_ligerito_union_circuit_ag_deferred<Ch: Challenger>(
         proof.boolean.as_ref().map(BooleanPiopRef::Ag),
         proof.element.as_ref(),
         Some(&proof.wiring),
-        &proof.channels,
+        &[],
         true,
         pcs_params,
         challenger,
@@ -1454,14 +1456,45 @@ pub fn verify_ligerito_union_circuit<Ch: Challenger>(
     pcs_params: &crate::pcs::PcsParams,
     challenger: &mut Ch,
 ) -> Result<crate::proof::UnionClassClaims, VerifyError> {
-    verify_ligerito_union_circuit_with_channels(
+    verify_circuit_with_channel_proofs(
         union,
         circuit,
         public,
         &[],
+        &[],
         circuits,
         commitment,
         proof,
+        pcs_params,
+        challenger,
+    )
+}
+
+/// Verify a circuit proof with multiset channels: `channels` are the specs
+/// the prover ran (verifier policy, like the circuit), replayed after the
+/// wiring in order. The returned claims carry each channel's challenge and
+/// both roots.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_with_channels<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    channels: &[crate::channel::ChannelSpec],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitChannels,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<crate::proof::UnionClassClaims, VerifyError> {
+    verify_circuit_with_channel_proofs(
+        union,
+        circuit,
+        public,
+        channels,
+        &proof.channels,
+        circuits,
+        commitment,
+        &proof.circuit,
         pcs_params,
         challenger,
     )
@@ -1487,14 +1520,50 @@ pub fn verify_ligerito_union_circuit_deferred<Ch: Challenger>(
     ),
     VerifyError,
 > {
-    verify_ligerito_union_circuit_deferred_with_channels(
+    verify_circuit_deferred_with_channel_proofs(
         union,
         circuit,
         public,
         &[],
+        &[],
         circuits,
         commitment,
         proof,
+        pcs_params,
+        challenger,
+    )
+}
+
+/// [`verify_ligerito_union_circuit_with_channels`] with the matrix work
+/// left undischarged — what a merge node runs on each child proof.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_ligerito_union_circuit_deferred_with_channels<Ch: Challenger>(
+    union: &crate::union::UnionInstance<'_>,
+    circuit: &crate::circuit::Circuit,
+    public: &[F128],
+    channels: &[crate::channel::ChannelSpec],
+    circuits: &[&dyn lincheck::LincheckCircuit],
+    commitment: &Commitment,
+    proof: &crate::proof::R1csProofCircuitChannels,
+    pcs_params: &crate::pcs::PcsParams,
+    challenger: &mut Ch,
+) -> Result<
+    (
+        crate::proof::UnionClassClaims,
+        DeferredMatrixWork,
+        crate::circuit::SigmaAssertion,
+    ),
+    VerifyError,
+> {
+    verify_circuit_deferred_with_channel_proofs(
+        union,
+        circuit,
+        public,
+        channels,
+        &proof.channels,
+        circuits,
+        commitment,
+        &proof.circuit,
         pcs_params,
         challenger,
     )

@@ -523,7 +523,7 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
     Commitment,
     flock_core::proof::UnionClassClaims,
 ) {
-    prove_fast_ligerito_union_circuit_with_channels(
+    let (proof, commitment, claims) = prove_fast_ligerito_union_circuit_with_channels(
         union,
         circuit,
         public,
@@ -532,12 +532,16 @@ pub fn prove_fast_ligerito_union_circuit<Ch: Challenger>(
         slots,
         element_slots,
         challenger,
-    )
+    );
+    debug_assert!(proof.channels.is_empty());
+    (proof.circuit, commitment, claims)
 }
 
 /// [`prove_fast_ligerito_union_circuit`] with multiset channels
 /// ([`flock_core::channel`]): each spec is proven after the wiring, in
-/// order, and its claims join the same merged opening. Verify with
+/// order, and its claims join the same merged opening. The circuit proof's
+/// wire format is unchanged; the channel transcripts ride beside it in
+/// [`flock_core::proof::R1csProofCircuitChannels`]. Verify with
 /// [`flock_core::verifier::verify_ligerito_union_circuit_with_channels`]
 /// (or the `_deferred` twin) under the same specs.
 #[allow(clippy::too_many_arguments)]
@@ -551,7 +555,7 @@ pub fn prove_fast_ligerito_union_circuit_with_channels<Ch: Challenger>(
     element_slots: Vec<UnionElementSlotInput<'_>>,
     challenger: &mut Ch,
 ) -> (
-    flock_core::proof::R1csProofCircuitMerged,
+    flock_core::proof::R1csProofCircuitChannels,
     Commitment,
     flock_core::proof::UnionClassClaims,
 ) {
@@ -597,12 +601,14 @@ pub fn prove_fast_ligerito_union_circuit_with_channels<Ch: Challenger>(
     };
     let (channel_proofs, channel_outputs): (Vec<_>, Vec<_>) = channels.into_iter().unzip();
     (
-        flock_core::proof::R1csProofCircuitMerged {
-            boolean: bool_proof,
-            element: el_proof,
-            wiring: wiring.expect("the circuit binding runs the wiring argument"),
+        flock_core::proof::R1csProofCircuitChannels {
+            circuit: flock_core::proof::R1csProofCircuitMerged {
+                boolean: bool_proof,
+                element: el_proof,
+                wiring: wiring.expect("the circuit binding runs the wiring argument"),
+                pcs_open,
+            },
             channels: channel_proofs,
-            pcs_open,
         },
         commitment,
         flock_core::proof::UnionClassClaims {
@@ -754,7 +760,6 @@ pub fn prove_fast_ligerito_union_circuit_ag<Ch: Challenger>(
             boolean: bool_proof,
             element: el_proof,
             wiring: wiring.expect("the circuit binding runs the wiring argument"),
-            channels: Vec::new(),
             pcs_open,
         },
         commitment,
