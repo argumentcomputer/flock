@@ -198,12 +198,17 @@ pub struct ChannelProof {
 }
 
 /// What a verified channel leaves for the enclosing statement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelOutput {
     pub alpha: F128,
     pub beta: F128,
     pub top_lhs: F128,
     pub top_rhs: F128,
+    /// The packed-direct gather claims `(point, value)` on the union
+    /// polynomial, gate columns LEFT then RIGHT in spec order — what an
+    /// enclosing statement opens a side commitment against to bind the
+    /// same columns elsewhere.
+    pub gathers: Vec<(Vec<F128>, F128)>,
 }
 
 /// Why a channel proof was rejected.
@@ -357,6 +362,7 @@ pub fn prove_channel<C: Challenger>(
         beta,
         top_lhs: gkr.top_lhs,
         top_rhs: gkr.top_rhs,
+        gathers: claims.iter().map(|c| (c.point.clone(), c.value)).collect(),
     };
     (
         ChannelProof {
@@ -482,12 +488,13 @@ pub fn verify_channel<C: Challenger>(
         return Err(ChannelError::Recombination);
     }
     Ok((
-        points,
+        points.clone(),
         ChannelOutput {
             alpha,
             beta,
             top_lhs: proof.gkr.top_lhs,
             top_rhs: proof.gkr.top_rhs,
+            gathers: points,
         },
     ))
 }

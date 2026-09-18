@@ -236,7 +236,7 @@ fn balanced_channel_over_a_permutation_verifies() {
     )
     .expect("a permuted multiset balances");
     assert_eq!(claims.channels, prover_claims.channels);
-    let out = claims.channels[0];
+    let out = &claims.channels[0];
     assert_eq!(out.top_lhs, out.top_rhs);
     assert_eq!(out.top_lhs, native_product(&a, out.alpha, out.beta));
 
@@ -360,7 +360,7 @@ fn exported_products_under_a_public_challenge() {
         &pcs_params,
     )
     .expect("an exported channel never requires balance");
-    let out = claims.channels[0];
+    let out = &claims.channels[0];
     assert_eq!((out.alpha, out.beta), (alpha, beta));
     assert_eq!(out.top_lhs, native_product(&a, alpha, beta));
     assert_eq!(out.top_rhs, native_product(&b, alpha, beta));
@@ -465,7 +465,7 @@ fn public_root_balance_pins_both_products_to_statement_words() {
         &pcs_params,
     )
     .expect("roots equal to their statement words verify");
-    let out = claims.channels[0];
+    let out = &claims.channels[0];
     assert_eq!((out.top_lhs, out.top_rhs), (produced, consumed));
 
     // A proof made under a statement claiming the wrong products is rejected
