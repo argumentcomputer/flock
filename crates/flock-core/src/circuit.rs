@@ -451,26 +451,36 @@ impl Circuit {
                 _ => None,
             }
         };
-        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); total_gates];
-        let mut indeg = vec![0usize; total_gates];
+        // Each class is a node of its own between its producers and its
+        // consumers: `producers + consumers` edges per class instead of
+        // `producers x consumers`, the same reachability (a cycle through a
+        // class node is a cycle through one of its producer-consumer pairs).
+        // A shared constant class with a million producers and consumers
+        // made the product quadratic.
+        let nodes = total_gates + classes.len();
+        let mut succ: Vec<Vec<usize>> = vec![Vec::new(); nodes];
+        let mut indeg = vec![0usize; nodes];
         for (ci, class) in classes.iter().enumerate() {
+            let node = total_gates + ci;
             for &prod_idx in &producers[ci] {
                 let from = gate_of(prod_idx).expect("a producer cell is a gate cell");
-                for &idx in class {
-                    let iota = idx >> nu;
-                    let CellSlot::Gate { word, .. } = cells.slots()[iota] else {
-                        continue;
-                    };
-                    if word.dir != IoDirection::In {
-                        continue;
-                    }
-                    let to = gate_of(idx).expect("gate cell");
-                    succ[from].push(to);
-                    indeg[to] += 1;
+                succ[from].push(node);
+                indeg[node] += 1;
+            }
+            for &idx in class {
+                let iota = idx >> nu;
+                let CellSlot::Gate { word, .. } = cells.slots()[iota] else {
+                    continue;
+                };
+                if word.dir != IoDirection::In {
+                    continue;
                 }
+                let to = gate_of(idx).expect("gate cell");
+                succ[node].push(to);
+                indeg[to] += 1;
             }
         }
-        let mut queue: Vec<usize> = (0..total_gates).filter(|&g| indeg[g] == 0).collect();
+        let mut queue: Vec<usize> = (0..nodes).filter(|&g| indeg[g] == 0).collect();
         let mut seen = 0usize;
         while let Some(g) = queue.pop() {
             seen += 1;
@@ -481,7 +491,7 @@ impl Circuit {
                 }
             }
         }
-        if seen != total_gates {
+        if seen != nodes {
             return Err(CircuitError::Cyclic);
         }
 
