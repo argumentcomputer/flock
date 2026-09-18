@@ -118,6 +118,27 @@ pub trait GateType {
     /// record. `hint` is this instance's advice — see [`Hint`](GateType::Hint).
     fn eval(&self, inputs: &[F128], hint: &Self::Hint, outputs: &mut Vec<F128>) -> Self::Row;
 
+    /// Evaluate `lanes` gates that share `hint` at once: `inputs` holds the
+    /// lanes' input words lane-major (`n_in` each), the lanes' outputs are
+    /// PUSHED onto `outputs` lane-major, and the rows come back in lane
+    /// order. Same result as `lanes` calls of [`eval`](GateType::eval); a
+    /// gate with a lane-parallel evaluator (a Boolean plan run bit-sliced)
+    /// overrides this. The fill-plan runner batches every unhinted run of
+    /// one slot's gates through it — see [`ShapeBuilder::lockstep`].
+    fn eval_batch(
+        &self,
+        lanes: usize,
+        n_in: usize,
+        inputs: &[F128],
+        hint: &Self::Hint,
+        outputs: &mut Vec<F128>,
+    ) -> Vec<Self::Row> {
+        debug_assert_eq!(inputs.len(), lanes * n_in);
+        (0..lanes)
+            .map(|lane| self.eval(&inputs[lane * n_in..(lane + 1) * n_in], hint, outputs))
+            .collect()
+    }
+
     /// The slot's committed witness, given every row in instantiation order
     /// and the uniform capacity `nu`. Rows `[rows.len(), 2^nu)` are dummy and
     /// must be written as zeros — the PIOP sums over the whole region.
@@ -162,6 +183,7 @@ trait SlotBuild: Any + Send + Sync {
         hints: &[&(dyn Any + Sync)],
         hint_base: usize,
         hinted: bool,
+        independent: bool,
         scratch_in: &mut Vec<F128>,
         scratch_out: &mut Vec<F128>,
     );
@@ -251,6 +273,7 @@ where
         hints: &[&(dyn Any + Sync)],
         hint_base: usize,
         hinted: bool,
+        independent: bool,
         scratch_in: &mut Vec<F128>,
         scratch_out: &mut Vec<F128>,
     ) {
@@ -258,6 +281,44 @@ where
             .downcast_mut::<Vec<G::Row>>()
             .expect("row store belongs to another slot");
         let unit = ();
+        if !hinted && independent {
+            // One lane-parallel evaluation of the whole batch.
+            let hint = (&unit as &dyn Any).downcast_ref::<G::Hint>().unwrap_or_else(|| {
+                panic!(
+                    "gate expects a hint of type {}; use gate_hinted and supply one",
+                    std::any::type_name::<G::Hint>()
+                )
+            });
+            scratch_in.clear();
+            for &i in &in_idx[..n * self.n_in] {
+                scratch_in.push(values[i as usize]);
+            }
+            scratch_out.clear();
+            let batch = self.gate.eval_batch(n, self.n_in, scratch_in, hint, scratch_out);
+            assert_eq!(
+                (batch.len(), scratch_out.len()),
+                (n, n * self.n_out),
+                "gate returned {} rows and {} outputs for {} lanes, schema declares {} outputs each",
+                batch.len(),
+                scratch_out.len(),
+                n,
+                self.n_out
+            );
+            for (k, &v) in scratch_out.iter().enumerate() {
+                let oi = out_idx[k];
+                let r = (oi & !FILL_CHECK) as usize;
+                if oi & FILL_CHECK != 0 {
+                    assert_eq!(
+                        values[r], v,
+                        "a connected wire disagrees with the gate output that produces it"
+                    );
+                } else {
+                    values[r] = v;
+                }
+            }
+            rows.extend(batch);
+            return;
+        }
         for g in 0..n {
             scratch_in.clear();
             for &i in &in_idx[g * self.n_in..(g + 1) * self.n_in] {
@@ -339,6 +400,11 @@ struct FillBatch {
     /// Hinted steps before this batch: the ordinal of the batch's first hint.
     hint_base: u32,
     hinted: bool,
+    /// No gate of the batch reads an earlier gate's output: the batch is
+    /// one lane-parallel evaluation ([`GateType::eval_batch`]). A chain
+    /// (each gate consuming the previous one's output) evaluates gate by
+    /// gate.
+    independent: bool,
 }
 
 /// One declared island, compiled for parallel execution on a COMPACT tape of
@@ -428,7 +494,14 @@ pub struct ShapeBuilder {
     /// online phase evaluates them in parallel. Declared by the caller via
     /// [`ShapeBuilder::begin_island`]/[`ShapeBuilder::end_island`].
     islands: Vec<(usize, usize)>,
+    /// Declared repetitions ([`ShapeBuilder::lockstep`]): step spans, in
+    /// step order, that `finish` reorders lane-parallel.
+    lockstep: Vec<core::ops::Range<usize>>,
 }
+
+/// Repetitions per lockstep chunk: the lanes one [`GateType::eval_batch`]
+/// call evaluates.
+pub const LOCKSTEP_LANES: usize = 64;
 
 impl ShapeBuilder {
     pub fn new(nu: usize) -> Self {
@@ -445,7 +518,118 @@ impl ShapeBuilder {
             rows_per_slot: Vec::new(),
             n_hints: 0,
             islands: Vec::new(),
+            lockstep: Vec::new(),
         }
+    }
+
+    /// Declare repetitions: each range is the steps of one instance of a
+    /// repeated gate pattern (one transition of an execution, one memory
+    /// access), ascending and disjoint, all unhinted, none straddling an
+    /// island boundary. Consecutive ranges with the same slot pattern are
+    /// dealt into chunks of [`LOCKSTEP_LANES`] and `finish` orders each
+    /// chunk position-major — the chunk's first gates, then its second
+    /// gates, and so on — so every slot's rows within the chunk are the
+    /// lanes of one position, and the fill plan runs them as one
+    /// [`GateType::eval_batch`] call. A chunk never crosses an island
+    /// boundary. The circuit is the same relation with its rows permuted:
+    /// each repetition may read only wires produced before the pattern's
+    /// first repetition or inside itself (the fill plan's definedness check
+    /// rejects anything else), so the reordered steps evaluate identically
+    /// and every slot's declared count stays the rows in use up to the last
+    /// chunk holding a live repetition.
+    pub fn lockstep(&mut self, repetitions: &[core::ops::Range<usize>]) {
+        let mut previous = self.lockstep.last().map_or(0, |r| r.end);
+        for range in repetitions {
+            assert!(
+                range.start >= previous && range.end <= self.steps.len(),
+                "lockstep repetitions must be ascending, disjoint step spans"
+            );
+            previous = range.end;
+            self.lockstep.push(range.clone());
+        }
+    }
+
+    /// The step order `lockstep` asks for: old step index per new position,
+    /// or `None` when nothing was declared.
+    fn lockstep_order(&self) -> Option<Vec<usize>> {
+        if self.lockstep.is_empty() {
+            return None;
+        }
+        let boundaries: std::collections::BTreeSet<usize> = self
+            .islands
+            .iter()
+            .flat_map(|&(start, end)| [start, end])
+            .collect();
+        let crosses = |range: &core::ops::Range<usize>| {
+            boundaries.range(range.start + 1..range.end).next().is_some()
+        };
+        let mut order: Vec<usize> = (0..self.steps.len()).collect();
+        let reps = &self.lockstep;
+        let trace = std::env::var("LOCKSTEP_TRACE").is_ok();
+        let (mut runs, mut chunks, mut lanes) = (0usize, 0usize, 0usize);
+        let mut i = 0;
+        while i < reps.len() {
+            assert!(!crosses(&reps[i]), "a lockstep repetition straddles an island boundary");
+            let pattern: Vec<usize> = self.steps[reps[i].clone()].iter().map(|s| s.slot).collect();
+            assert!(
+                self.steps[reps[i].clone()].iter().all(|s| !s.hinted),
+                "lockstep repetitions are unhinted"
+            );
+            let mut j = i + 1;
+            while j < reps.len()
+                && reps[j].start == reps[j - 1].end
+                && !boundaries.contains(&reps[j].start)
+                && reps[j].len() == pattern.len()
+                && !crosses(&reps[j])
+                && self.steps[reps[j].clone()].iter().zip(&pattern).all(|(s, &p)| s.slot == p)
+                && self.steps[reps[j].clone()].iter().all(|s| !s.hinted)
+            {
+                j += 1;
+            }
+            let period = pattern.len();
+            runs += 1;
+            if trace && j < reps.len() && runs <= 12 {
+                let next: Vec<usize> = self.steps[reps[j].clone()].iter().map(|s| s.slot).collect();
+                let differ = pattern.iter().zip(&next).position(|(a, b)| a != b);
+                eprintln!(
+                    "  [lockstep] run {runs} ends at repetition {j} (steps {}..{}): {} lanes of {period} gates; next has {} gates, first difference at {:?} (consecutive {}, boundary {}); pattern {:?} next {:?}",
+                    reps[j - 1].start,
+                    reps[j - 1].end,
+                    j - i,
+                    next.len(),
+                    differ,
+                    reps[j].start == reps[j - 1].end,
+                    boundaries.contains(&reps[j].start),
+                    &pattern[..pattern.len().min(24)],
+                    &next[..next.len().min(24)],
+                );
+            }
+            let mut first = i;
+            while first < j {
+                let last = (first + LOCKSTEP_LANES).min(j);
+                chunks += 1;
+                lanes += last - first;
+                let mut at = reps[first].start;
+                for position in 0..period {
+                    for rep in first..last {
+                        order[at] = reps[rep].start + position;
+                        at += 1;
+                    }
+                }
+                debug_assert_eq!(at, reps[last - 1].end);
+                first = last;
+            }
+            i = j;
+        }
+        if trace {
+            eprintln!(
+                "  [lockstep] {} repetitions in {runs} runs, {chunks} chunks ({:.1} lanes each), {} islands",
+                reps.len(),
+                lanes as f64 / chunks.max(1) as f64,
+                self.islands.len()
+            );
+        }
+        Some(order)
     }
 
     fn find(&mut self, w: Wire) -> usize {
@@ -711,6 +895,35 @@ impl ShapeBuilder {
         let num_gate_slots = acc;
         let rows_per_public_slot = 1usize << self.nu;
 
+        // Lockstep: permute the steps and remap every cell's row, a slot's
+        // rows being its steps' positions in the new order.
+        if let Some(order) = self.lockstep_order() {
+            let old_steps = std::mem::take(&mut self.steps);
+            let mut old_row = vec![0usize; old_steps.len()];
+            let mut counter = vec![0usize; self.slots.len()];
+            for (i, st) in old_steps.iter().enumerate() {
+                old_row[i] = counter[st.slot];
+                counter[st.slot] += 1;
+            }
+            let mut row_map: Vec<Vec<usize>> = counter.iter().map(|&c| vec![usize::MAX; c]).collect();
+            counter.fill(0);
+            let mut taken: Vec<Option<Step>> = old_steps.into_iter().map(Some).collect();
+            let mut steps = Vec::with_capacity(taken.len());
+            for &old in &order {
+                let st = taken[old].take().expect("the lockstep order places each step once");
+                row_map[st.slot][old_row[old]] = counter[st.slot];
+                counter[st.slot] += 1;
+                steps.push(st);
+            }
+            assert!(taken.iter().all(Option::is_none), "the lockstep order places every step");
+            self.steps = steps;
+            for cells in &mut self.wires {
+                for c in cells.iter_mut() {
+                    let (declared, _) = decode(c.slot);
+                    c.row = row_map[declared][c.row];
+                }
+            }
+        }
         // Resolve the placeholder cells to real cell-slot indices.
         for cells in &mut self.wires {
             for c in cells.iter_mut() {
@@ -1070,6 +1283,8 @@ impl CircuitShape {
 
         let mut batches: Vec<FillBatch> = Vec::new();
         let mut batch_step0: Vec<usize> = Vec::new();
+        // The current batch's outputs so far, for the independence flag.
+        let mut batch_outputs: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let mut in_idx = Vec::new();
         let mut out_idx = Vec::new();
         let mut n_hinted = 0usize;
@@ -1090,10 +1305,17 @@ impl CircuitShape {
                     out_off: out_idx.len() as u32,
                     hint_base: n_hinted as u32,
                     hinted: step.hinted,
+                    independent: true,
                 });
                 batch_step0.push(s);
+                batch_outputs.clear();
             }
-            batches.last_mut().expect("just pushed").n += 1;
+            let batch = batches.last_mut().expect("just pushed");
+            batch.n += 1;
+            if step.inputs.iter().any(|r| batch_outputs.contains(r)) {
+                batch.independent = false;
+            }
+            batch_outputs.extend(step.outputs.iter().copied());
             if step.hinted {
                 n_hinted += 1;
             }
@@ -1140,6 +1362,7 @@ impl CircuitShape {
                 let mut scatter: Vec<(u32, u32)> = Vec::new();
                 let mut tape_len = 0u32;
                 let intern_read = |r: usize,
+                                   at: (usize, usize),
                                    local_of: &mut Vec<u32>,
                                    touched: &mut Vec<usize>,
                                    gather: &mut Vec<(u32, u32)>,
@@ -1149,7 +1372,12 @@ impl CircuitShape {
                     }
                     assert!(
                         def_at[r] == DEF_INPUT || (def_at[r] as usize) < first_start,
-                        "an island reads a wire another island writes"
+                        "an island reads a wire another island writes: island {a}..{b}, step {} \
+                         (slot {}) reads class root {r} defined by step {} (slot {})",
+                        at.0,
+                        at.1,
+                        def_at[r],
+                        self.steps.get(def_at[r] as usize).map_or(usize::MAX, |s| s.slot)
                     );
                     let l = *tape_len;
                     *tape_len += 1;
@@ -1167,6 +1395,7 @@ impl CircuitShape {
                         for e in &mut in_idx[i0..i0 + n_in] {
                             *e = intern_read(
                                 *e as usize,
+                                (batch_step0[bi] + g, slot),
                                 &mut local_of,
                                 &mut touched,
                                 &mut gather,
@@ -1180,6 +1409,7 @@ impl CircuitShape {
                             let l = if check {
                                 intern_read(
                                     r,
+                                    (batch_step0[bi] + g, slot),
                                     &mut local_of,
                                     &mut touched,
                                     &mut gather,
@@ -1470,6 +1700,7 @@ impl CircuitShape {
                 hints,
                 b.hint_base as usize,
                 b.hinted,
+                b.independent,
                 scratch_in,
                 scratch_out,
             );
@@ -2063,6 +2294,126 @@ mod tests {
     /// product, a forward-referenced check INSIDE an island (gathered, then
     /// asserted), and a suffix joining both islands' ends — identical to the
     /// walk's parallel island mode, without its value-state clones.
+    /// Lockstep: the same repeated pattern built plain and lockstepped
+    /// (chunks of `LOCKSTEP_LANES` repetitions, position-major, across two
+    /// islands and a suffix that reads every repetition's result). The
+    /// lockstepped shape's walk and fill plan agree, its publics and its
+    /// per-slot row multisets equal the plain shape's, its rows are the
+    /// plain rows permuted position-major within each chunk, and every
+    /// wire's cells name rows holding that wire's value.
+    #[test]
+    fn lockstep_reorders_repetitions_position_major() {
+        let (nu, kappa) = (9usize, 3usize);
+        let reps = 150usize;
+        let mut state = 0x10C4_57E9_0001u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let hi = state;
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            F128::new(hi, state)
+        };
+        let xs: Vec<[F128; 2]> = (0..reps).map(|_| [next(), next()]).collect();
+        let build = |lockstep: bool| {
+            let mut b = ShapeBuilder::new(nu);
+            let mult = b.slot(MultGate::new(kappa));
+            let other = b.slot(MultGate::new(kappa));
+            let mut vals = Vec::new();
+            let mut results = Vec::new();
+            let mut ranges = Vec::new();
+            for (r, x) in xs.iter().enumerate() {
+                let island = (r == 0 || r == reps / 2).then(|| b.begin_island());
+                let start = b.steps.len();
+                vals.extend(x);
+                let a = b.public_input();
+                let c = b.public_input();
+                // The pattern: mult, other, mult — the first slot twice.
+                let p = b.gate(mult, &[a, c])[0];
+                let q = b.gate(other, &[p, a])[0];
+                let s = b.gate(mult, &[q, c])[0];
+                results.push(s);
+                ranges.push(start..b.steps.len());
+                if let Some(start) = island {
+                    let _ = start;
+                }
+                if r == reps / 2 - 1 || r == reps - 1 {
+                    // Close the island opened at the run's first repetition.
+                    let open = if r == reps / 2 - 1 { ranges[0].start } else { ranges[reps / 2].start };
+                    b.end_island(open);
+                }
+            }
+            if lockstep {
+                b.lockstep(&ranges);
+            }
+            // The suffix multiplies every result into one word.
+            let mut acc = results[0];
+            for &s in &results[1..] {
+                acc = b.gate(other, &[acc, s])[0];
+            }
+            b.publish(acc);
+            (b.finish().expect("the shape builds"), vals)
+        };
+        let (plain, vals) = build(false);
+        let (locked, vals2) = build(true);
+        assert_eq!(vals, vals2);
+        let plain_w = plain.run(&vals, &[]);
+        let walk = locked.run(&vals, &[]);
+        let plan = locked.fill_plan();
+        let fill = locked.run_filled(&plan, &vals, &[]);
+        assert_eq!(walk.public, fill.public);
+        assert_eq!(walk.public, plain_w.public);
+        assert_eq!(walk.content, fill.content);
+        for slot in [SlotId(0), SlotId(1)] {
+            let plain_rows = plain_w.rows::<MultGate>(slot);
+            let walk_rows = walk.rows::<MultGate>(slot);
+            let fill_rows = fill.rows::<MultGate>(slot);
+            assert_eq!(walk_rows, fill_rows);
+            let mut a = plain_rows.to_vec();
+            let mut b = walk_rows.to_vec();
+            let key = |r: &(F128, F128, F128)| (r.0.lo, r.0.hi, r.1.lo, r.1.hi, r.2.lo, r.2.hi);
+            a.sort_by_key(key);
+            b.sort_by_key(key);
+            assert_eq!(a, b, "slot {} rows are a permutation", slot.0);
+        }
+        // The first slot's first chunk: repetition r's first gate is row r
+        // (position 0 of the chunk), its third gate row LOCKSTEP_LANES + r.
+        let rows = walk.rows::<MultGate>(SlotId(0));
+        for r in 0..LOCKSTEP_LANES {
+            assert_eq!(rows[r].0, xs[r][0], "position 0 lane {r}");
+            assert_eq!(rows[LOCKSTEP_LANES + r].1, xs[r][1], "position 1 lane {r}");
+        }
+        assert_ne!(plain.circuit.digest(), locked.circuit.digest());
+        // Every wire's cells hold the wire's value in the lockstepped rows.
+        let cells = locked.circuit.cells();
+        let counts = locked.circuit.counts();
+        assert_eq!(counts, plain.circuit.counts());
+        let value_at = |slot: usize, word: usize, row: usize| -> F128 {
+            let rows = walk.rows::<MultGate>(SlotId(slot));
+            let r = &rows[row];
+            [r.0, r.1, r.2][word]
+        };
+        let mut checked = 0;
+        for class in locked.circuit.wires() {
+            let mut values = Vec::new();
+            for &cell in class {
+                let (slot, row) = (cell >> nu, cell & ((1 << nu) - 1));
+                if slot < cells.num_gate_slots() {
+                    let super::super::CellSlot::Gate { ty, .. } = cells.slots()[slot] else { unreachable!() };
+                    let base: usize = (0..ty).map(|t| locked.registry.types()[t].io_schema.len()).sum();
+                    let word = slot - base;
+                    let declared = locked.registry_slot.iter().position(|&s| s == ty).unwrap();
+                    values.push(value_at(declared, word, row));
+                }
+            }
+            assert!(values.windows(2).all(|w| w[0] == w[1]), "a wire class disagrees");
+            checked += values.len();
+        }
+        assert!(checked > 6 * reps);
+    }
+
     #[test]
     fn fill_plan_matches_the_walk_across_islands() {
         let (nu, kappa, n) = (6usize, 3usize, 8usize);
