@@ -65,6 +65,7 @@ use crate::matrix_fold::{MatrixClaim, Weight};
 use crate::schedule::Registry;
 use crate::union::UnionInstance;
 use crate::zerocheck::K_SKIP;
+use std::collections::HashMap;
 
 use super::{
     LincheckCircuit, LincheckClaim, LincheckGrinding, LincheckProof, QuirkyPoint, SkipPoint,
@@ -285,6 +286,10 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
     };
     // Per-type (ξ_A, ξ_B), kept for the matrix-eval report after the sumcheck.
     let mut split_combs: Vec<(Vec<F128>, Vec<F128>)> = Vec::with_capacity(registry.num_boolean());
+    // Slots sharing one lincheck circuit (the same object, so the same
+    // matrices) at the same width fold once: the marginals depend on the
+    // circuit and the width alone.
+    let mut folds: HashMap<(usize, usize), (Vec<F128>, Vec<F128>)> = HashMap::new();
     for ((ty, slot), slot_in) in registry
         .boolean_types()
         .iter()
@@ -298,7 +303,15 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         );
         // Split, so the per-matrix bilinear values can be reported below.
         // Same nonzeros as the α-batched fold; only the accumulation differs.
-        let (comb_a, comb_b) = slot_in.circuit.fold_split(&eq_inner);
+        let key = (circuit_identity(slot_in.circuit), ty.k_log);
+        let (comb_a, comb_b) = match folds.get(&key) {
+            Some(folded) => folded.clone(),
+            None => {
+                let folded = slot_in.circuit.fold_split(&eq_inner);
+                folds.insert(key, folded.clone());
+                folded
+            }
+        };
         let comb_t: Vec<F128> = comb_a
             .iter()
             .zip(&comb_b)
@@ -424,6 +437,13 @@ pub fn prove_union_capture_z_vec_with_grinding<Ch: Challenger>(
         .collect();
 
     (proof, claim, captured)
+}
+
+/// A lincheck circuit's identity for fold sharing: its address. Two slots
+/// handed the same circuit object have the same matrices, so their column
+/// marginals at one width are equal and are computed once.
+fn circuit_identity(circuit: &dyn LincheckCircuit) -> usize {
+    (circuit as *const dyn LincheckCircuit).cast::<()>() as usize
 }
 
 /// `z_partial ⊗ eq(rr)` over a type's own `2^{k_skip + rr.len()}` column
@@ -588,6 +608,8 @@ impl MatrixAssertion {
             registry.num_boolean(),
             "one circuit per BOOLEAN registry type"
         );
+        // Shared circuits fold once (see the prover's `folds`).
+        let mut folds: HashMap<(usize, usize), Vec<F128>> = HashMap::new();
         let mut combs: Vec<Vec<F128>> = registry
             .boolean_types()
             .iter()
@@ -595,11 +617,19 @@ impl MatrixAssertion {
             .zip(circuits)
             .map(|((ty, slot), circuit)| {
                 let inner = ty.k_log - k_skip;
-                let eq_inner = build_quirky_eq_table_from_weights(
-                    &self.z_skip.weights(k_skip),
-                    &self.x_inner_rest[..inner],
-                );
-                let mut comb = circuit.fold_alpha_batched(self.alpha, &eq_inner);
+                let key = (circuit_identity(*circuit), ty.k_log);
+                let mut comb = match folds.get(&key) {
+                    Some(comb) => comb.clone(),
+                    None => {
+                        let eq_inner = build_quirky_eq_table_from_weights(
+                            &self.z_skip.weights(k_skip),
+                            &self.x_inner_rest[..inner],
+                        );
+                        let comb = circuit.fold_alpha_batched(self.alpha, &eq_inner);
+                        folds.insert(key, comb.clone());
+                        comb
+                    }
+                };
                 if slot.prefix_bits > 0 {
                     let w_t = eq_prefix_weight(&self.x_inner_rest[inner..], slot.prefix);
                     for v in &mut comb {
